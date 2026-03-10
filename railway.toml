@@ -1,0 +1,11 @@
+# Project Equinox — Railway deployment configuration.
+# Railway uses this file to build and deploy with Docker.
+# See RAILWAY.md for setup steps (env vars, Kalshi key).
+
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"

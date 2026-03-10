@@ -47,14 +47,15 @@ func TestLoadReturnsErrorWhenKalshiAPIKeyIDMissing(t *testing.T) {
 	}
 }
 
-func TestLoadReturnsErrorWhenKalshiAPIKeyPathMissing(t *testing.T) {
+func TestLoadReturnsErrorWhenKalshiKeyMissing(t *testing.T) {
 	env := minimalEnv()
 	env["KALSHI_API_KEY_PATH"] = ""
+	env["KALSHI_PRIVATE_KEY"] = ""
 	setEnv(t, env)
 
 	_, err := config.Load()
 	if err == nil {
-		t.Error("Load() = nil error, want error when KALSHI_API_KEY_PATH not set")
+		t.Error("Load() = nil error, want error when KALSHI_API_KEY_PATH and KALSHI_PRIVATE_KEY not set")
 	}
 }
 
@@ -89,6 +90,7 @@ func TestLoadStoresKalshiAPIKeyID(t *testing.T) {
 func TestLoadStoresKalshiAPIKeyPath(t *testing.T) {
 	env := minimalEnv()
 	env["KALSHI_API_KEY_PATH"] = "/secrets/kalshi.pem"
+	env["KALSHI_PRIVATE_KEY"] = "" // Prefer path when both could be set
 	setEnv(t, env)
 
 	cfg, err := config.Load()
@@ -100,6 +102,21 @@ func TestLoadStoresKalshiAPIKeyPath(t *testing.T) {
 	}
 }
 
+func TestLoadUsesKalshiPrivateKeyWhenPathNotSet(t *testing.T) {
+	env := minimalEnv()
+	env["KALSHI_API_KEY_PATH"] = ""
+	env["KALSHI_PRIVATE_KEY"] = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
+	setEnv(t, env)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.KalshiAPIKeyPath == "" {
+		t.Error("KalshiAPIKeyPath empty, want temp file path when KALSHI_PRIVATE_KEY set")
+	}
+}
+
 func TestLoadDefaultKalshiBaseURL(t *testing.T) {
 	setEnv(t, minimalEnv())
 
@@ -108,7 +125,7 @@ func TestLoadDefaultKalshiBaseURL(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	want := "https://trading-api.kalshi.com/trade-api/v2"
+	want := "https://api.elections.kalshi.com/trade-api/v2"
 	if cfg.KalshiBaseURL != want {
 		t.Errorf("KalshiBaseURL = %q, want %q", cfg.KalshiBaseURL, want)
 	}
@@ -224,6 +241,21 @@ func TestLoadOverridesServerPort(t *testing.T) {
 
 	if cfg.ServerPort != "9090" {
 		t.Errorf("ServerPort = %q, want %q", cfg.ServerPort, "9090")
+	}
+}
+
+func TestLoadUsesPortWhenServerPortNotSet(t *testing.T) {
+	env := minimalEnv()
+	env["SERVER_PORT"] = ""
+	env["PORT"] = "3000"
+	setEnv(t, env)
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.ServerPort != "3000" {
+		t.Errorf("ServerPort = %q, want %q (from PORT)", cfg.ServerPort, "3000")
 	}
 }
 
