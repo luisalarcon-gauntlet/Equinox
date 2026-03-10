@@ -1,0 +1,154 @@
+---
+description: Go coding patterns for Project Equinox
+globs: **/*.go
+---
+
+# Go Patterns — Project Equinox
+
+## Error Handling Pattern
+Always use the EquinoxError struct. Never return raw errors.
+
+```go
+// CORRECT
+data, err := someOperation()
+if err != nil {
+    return nil, &equinoxerrors.EquinoxError{
+        Layer:   "connector",
+        Venue:   "kalshi",
+        Message: "failed to fetch markets",
+        Err:     err,
+    }
+}
+
+// WRONG — never do this
+data, err := someOperation()
+if err != nil {
+    return nil, err
+}
+
+// WRONG — never do this
+data, err := someOperation()
+if err != nil {
+    return nil, fmt.Errorf("failed: %w", err)
+}
+```
+
+## Struct Definitions
+Always include JSON tags on raw venue structs.
+Always include comments on canonical model fields.
+
+```go
+// Raw venue struct — JSON tags required
+type KalshiMarket struct {
+    Ticker    string  `json:"ticker"`
+    YesBid    float64 `json:"yes_bid"`
+    CloseTime string  `json:"close_time"`
+}
+
+// Canonical struct — comments required
+type Market struct {
+    // Identity
+    ID    string // internal UUID we generate
+    Venue string // "kalshi" or "polymarket"
+}
+```
+
+## Interface Pattern
+All venue connectors must implement VenueConnector.
+Interfaces are defined in the package that uses them, not the package that implements them.
+
+```go
+type VenueConnector interface {
+    FetchMarkets(ctx context.Context, query string) ([]models.Market, error)
+    GetVenueName() string
+}
+```
+
+## Context Pattern
+Always accept context.Context as the first parameter in functions that make network calls.
+Always respect context cancellation.
+
+```go
+// CORRECT
+func (c *KalshiClient) FetchMarkets(ctx context.Context, query string) ([]models.Market, error) {
+    req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+    ...
+}
+
+// WRONG
+func (c *KalshiClient) FetchMarkets(query string) ([]models.Market, error) {
+    req, err := http.NewRequest("GET", url, nil)
+    ...
+}
+```
+
+## HTTP Client Pattern
+Always set timeouts. Always check status codes explicitly.
+
+```go
+client := &http.Client{
+    Timeout: 10 * time.Second,
+}
+
+resp, err := client.Do(req)
+if err != nil {
+    return nil, &equinoxerrors.EquinoxError{...}
+}
+defer resp.Body.Close()
+
+if resp.StatusCode != http.StatusOK {
+    return nil, &equinoxerrors.EquinoxError{
+        Layer:   "connector",
+        Venue:   "kalshi",
+        Message: fmt.Sprintf("unexpected status code: %d", resp.StatusCode),
+    }
+}
+```
+
+## Concurrency Pattern
+Use goroutines + WaitGroup + error channels for parallel venue fetching.
+
+```go
+var wg sync.WaitGroup
+errCh := make(chan error, len(connectors))
+resultCh := make(chan []models.Market, len(connectors))
+
+for _, connector := range connectors {
+    wg.Add(1)
+    go func(c VenueConnector) {
+        defer wg.Done()
+        markets, err := c.FetchMarkets(ctx, query)
+        if err != nil {
+            errCh <- err
+            return
+        }
+        resultCh <- markets
+    }(connector)
+}
+
+wg.Wait()
+close(errCh)
+close(resultCh)
+```
+
+## Constants
+Always define API URLs, timeouts, and thresholds as named constants in config.
+
+```go
+const (
+    DefaultHTTPTimeout          = 10 * time.Second
+    HeuristicConfidenceThreshold = 0.80
+    PriceWeight                 = 0.40
+    LiquidityWeight             = 0.35
+    SpreadWeight                = 0.25
+)
+```
+
+## Logging Pattern
+Always log before returning errors. Use structured fields.
+
+```go
+logger.Error("connector", "kalshi", "failed to fetch markets", err)
+logger.Warn("routing", "", "stale price data detected", nil)
+logger.Info("equivalence", "", "heuristic match found", nil)
+```

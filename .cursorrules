@@ -1,0 +1,107 @@
+# Project Equinox — Cursor Rules
+# Cross-Venue Prediction Market Aggregation & Routing
+# These rules apply to every file in this project. Never violate them.
+
+## Project Identity
+- Project Name: Project Equinox
+- Language: Go 1.22+
+- Purpose: Infrastructure prototype that connects to Kalshi and Polymarket,
+  normalizes market data into a canonical internal representation, detects
+  equivalent markets across venues, and simulates routing decisions for
+  hypothetical trades.
+- This is NOT a trading product. No real money, no real orders, no wallets.
+
+## Core Architecture — Never Violate Layer Separation
+The system has exactly these layers in this order:
+1. Venue Connectors (venues/kalshi, venues/polymarket)
+2. Normalizer / Adapters (venues/kalshi/adapter.go, venues/polymarket/adapter.go)
+3. Canonical Models (models/)
+4. Equivalence Detector (equivalence/)
+5. AI Tool Layer (ai/, equivalence/tools/)
+6. Routing Engine (routing/)
+7. HTTP Server (server/)
+8. Static UI (static/)
+
+### Layer Rules — Strictly Enforced
+- routing/ must NEVER import venues/ packages. It only sees canonical models.
+- equivalence/ must NEVER make routing decisions.
+- ai/ must NEVER call Kalshi or Polymarket APIs directly.
+- server/ must NEVER contain business logic. Handlers call services only.
+- normalizer/adapters must NEVER call external APIs. They only transform data.
+- Heuristic layer must ALWAYS run before AI layer. AI is fallback only.
+
+## Folder Structure — Always Maintain This Exactly
+```
+equinox/
+├── main.go
+├── Makefile
+├── .env.example
+├── go.mod
+├── go.sum
+├── .cursorrules
+├── .cursor/rules/
+├── config/
+│   └── config.go
+├── venues/
+│   ├── connector.go
+│   ├── kalshi/
+│   │   ├── client.go
+│   │   ├── models.go
+│   │   └── adapter.go
+│   └── polymarket/
+│       ├── client.go
+│       ├── models.go
+│       └── adapter.go
+├── models/
+│   └── market.go
+├── equivalence/
+│   ├── detector.go
+│   ├── heuristic.go
+│   └── tools/
+│       ├── check_opposites.go
+│       ├── check_synonyms.go
+│       ├── check_entity_match.go
+│       ├── check_date_alignment.go
+│       └── check_structural.go
+├── routing/
+│   └── engine.go
+├── ai/
+│   └── client.go
+├── server/
+│   └── server.go
+├── static/
+│   └── index.html
+├── errors/
+│   └── errors.go
+├── logger/
+│   └── logger.go
+└── docs/
+    ├── ARCHITECTURE.md
+    ├── EQUIVALENCE.md
+    └── ROUTING.md
+```
+
+## Naming Conventions
+- Files: snake_case (check_opposites.go)
+- Structs: PascalCase (MarketMatch, RoutingDecision)
+- Interfaces: PascalCase ending in -er or -or (VenueConnector)
+- Functions: PascalCase for exported, camelCase for unexported
+- Constants: PascalCase (DefaultTimeout)
+- Variables: camelCase (venueScore)
+- Test files: same name as file being tested + _test suffix
+
+## What Is Strictly Forbidden
+- Never use panic() in production code
+- Never swallow errors silently
+- Never return raw errors — always wrap in EquinoxError
+- Never hardcode API URLs — use config package
+- Never hardcode the Anthropic API key — use environment variables
+- Never break layer separation for convenience
+- Never write implementation before tests (TDD strictly enforced)
+- Never use global mutable state
+- Never skip the heuristic layer and call AI directly
+
+## Go Version and Module
+- Module name: github.com/equinox
+- Go version: 1.22
+- Keep dependencies minimal and justified

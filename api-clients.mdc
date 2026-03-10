@@ -1,0 +1,168 @@
+---
+description: API client patterns for venue connectors
+globs: venues/**/*.go
+---
+
+# API Client Rules — Venue Connectors
+
+## Kalshi Public API
+- Base URL: https://trading-api.kalshi.com/trade-api/v2
+- Authentication: None required for public market data
+- Key endpoints:
+  - GET /markets — list markets with optional search
+  - GET /markets/{ticker} — single market by ticker
+- Rate limiting: Be respectful, add delays if needed
+
+## Polymarket Public API
+- Base URL: https://gamma-api.polymarket.com
+- Authentication: None required for public market data
+- Key endpoints:
+  - GET /markets — list markets with optional search/filter
+  - GET /markets/{id} — single market by ID
+- Note: Polymarket also has a CLOB API at clob.polymarket.com for order book data
+
+## HTTP Client Rules
+Every venue client must:
+
+```go
+// 1. Use a shared HTTP client with timeout (not http.DefaultClient)
+type KalshiClient struct {
+    httpClient *http.Client
+    baseURL    string
+    logger     *logger.Logger
+}
+
+func NewKalshiClient(cfg *config.Config, log *logger.Logger) *KalshiClient {
+    return &KalshiClient{
+        httpClient: &http.Client{
+            Timeout: cfg.HTTPTimeout, // from config, default 10s
+        },
+        baseURL: cfg.KalshiBaseURL,
+        logger:  log,
+    }
+}
+
+// 2. Always use context
+req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+
+// 3. Always set Accept header
+req.Header.Set("Accept", "application/json")
+
+// 4. Always check status code
+if resp.StatusCode != http.StatusOK {
+    return nil, &equinoxerrors.EquinoxError{
+        Layer:   "connector",
+        Venue:   "kalshi",
+        Message: fmt.Sprintf("API returned status %d", resp.StatusCode),
+    }
+}
+
+// 5. Always close body
+defer resp.Body.Close()
+
+// 6. Always decode into raw struct first
+var raw KalshiResponse
+if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+    return nil, &equinoxerrors.EquinoxError{
+        Layer:   "connector",
+        Venue:   "kalshi",
+        Message: "failed to decode response",
+        Err:     err,
+    }
+}
+```
+
+## Query Building
+Build URLs cleanly using url.Values:
+
+```go
+params := url.Values{}
+params.Set("limit", "50")
+if query != "" {
+    params.Set("search", query)
+}
+fullURL := fmt.Sprintf("%s/markets?%s", c.baseURL, params.Encode())
+```
+
+## Logging in Connectors
+Log at key points:
+
+```go
+// Before fetch
+c.logger.Info("connector", "kalshi", fmt.Sprintf("fetching markets for query: %s", query))
+
+// After successful fetch
+c.logger.Info("connector", "kalshi", fmt.Sprintf("fetched %d markets", len(markets)))
+
+// On warn (partial data)
+c.logger.Warn("connector", "kalshi", "market missing liquidity data, defaulting to 0")
+
+// On error (before returning)
+c.logger.Error("connector", "kalshi", "fetch failed", err)
+```
+
+## Adapter Rules
+The adapter transforms raw venue structs into canonical Market structs.
+Adapters live in venues/kalshi/adapter.go and venues/polymarket/adapter.go.
+
+```go
+// Adapter function signature — always this pattern
+func AdaptKalshiMarket(raw KalshiMarket) (models.Market, error) {
+    // 1. Parse dates
+    resolvesAt, err := time.Parse(time.RFC3339, raw.CloseTime)
+    if err != nil {
+        return models.Market{}, &equinoxerrors.EquinoxError{
+            Layer:   "normalizer",
+            Venue:   "kalshi",
+            Message: fmt.Sprintf("failed to parse close_time: %s", raw.CloseTime),
+            Err:     err,
+        }
+    }
+
+    // 2. Validate prices
+    if raw.YesBid < 0 || raw.YesBid > 1 || raw.YesAsk < 0 || raw.YesAsk > 1 {
+        return models.Market{}, &equinoxerrors.EquinoxError{
+            Layer:   "normalizer",
+            Venue:   "kalshi",
+            Message: fmt.Sprintf("invalid price range: bid=%f ask=%f", raw.YesBid, raw.YesAsk),
+        }
+    }
+
+    // 3. Build canonical market
+    mid := (raw.YesBid + raw.YesAsk) / 2
+    return models.Market{
+        ID:         generateID(raw.Ticker),
+        VenueID:    raw.Ticker,
+        Venue:      "kalshi",
+        Title:      normalizeTitle(raw.Title),
+        YesBid:     raw.YesBid,
+        YesAsk:     raw.YesAsk,
+        YesMid:     mid,
+        NoPrice:    1.0 - mid,
+        Spread:     raw.YesAsk - raw.YesBid,
+        Liquidity:  raw.Liquidity,
+        Volume24h:  raw.Volume24h,
+        ResolvesAt: resolvesAt,
+        FetchedAt:  time.Now(),
+        Category:   raw.Category,
+        Status:     raw.Status,
+        RawData:    raw,
+    }, nil
+}
+```
+
+## Title Normalization
+Always normalize titles for equivalence comparison:
+
+```go
+func normalizeTitle(title string) string {
+    // lowercase
+    title = strings.ToLower(title)
+    // remove punctuation
+    title = regexp.MustCompile(`[^\w\s]`).ReplaceAllString(title, "")
+    // collapse whitespace
+    title = strings.Join(strings.Fields(title), " ")
+    // trim
+    return strings.TrimSpace(title)
+}
+```

@@ -1,0 +1,24 @@
+# Environment and secrets
+.env
+
+# Build artifacts
+equinox
+*.exe
+
+# Test coverage
+coverage.out
+coverage_*
+*_cov
+*_cov.out
+venues_coverage
+
+# Secrets (never commit)
+kalshi_private_key.pem
+*.pem
+
+# IDE and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

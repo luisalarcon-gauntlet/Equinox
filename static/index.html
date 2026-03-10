@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Project Equinox</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #0d0d0f;
+      --surface:  #16161a;
+      --border:   #2a2a35;
+      --text:     #e2e2e8;
+      --muted:    #6b6b80;
+      --accent:   #5b6af0;
+      --kalshi:   #7c3aed;
+      --poly:     #0ea5e9;
+      --green:    #22c55e;
+      --yellow:   #fbbf24;
+      --red:      #ef4444;
+      --radius:   8px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 13px;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+
+    /* ── Header ── */
+    header {
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    header h1 { font-size: 16px; font-weight: 600; letter-spacing: 0.05em; }
+    header p  { color: var(--muted); font-size: 11px; margin-left: auto; }
+
+    .health-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--muted);
+      flex-shrink: 0;
+      transition: background 0.3s;
+    }
+    .health-dot.ok    { background: var(--green); }
+    .health-dot.error { background: var(--red); }
+
+    /* ── Main layout ── */
+    main { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+
+    /* ── Search ── */
+    .search-row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 32px;
+    }
+    .search-row input {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 13px;
+      padding: 10px 14px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .search-row input:focus { border-color: var(--accent); }
+    .search-row input::placeholder { color: var(--muted); }
+
+    button {
+      background: var(--accent);
+      border: none;
+      border-radius: var(--radius);
+      color: #fff;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      padding: 10px 20px;
+      transition: opacity 0.15s;
+    }
+    button:hover   { opacity: 0.85; }
+    button:active  { opacity: 0.7; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    button.secondary {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    /* ── Section heading ── */
+    .section-heading {
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+
+    /* ── Match cards ── */
+    .results-list { display: flex; flex-direction: column; gap: 12px; margin-bottom: 32px; }
+
+    .match-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      cursor: pointer;
+      overflow: hidden;
+      transition: border-color 0.2s;
+    }
+    .match-card:hover    { border-color: var(--accent); }
+    .match-card.selected { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: -1px; }
+    .match-card.opposites { border-color: var(--red); }
+    .match-card.opposites.selected { outline-color: var(--red); }
+
+    .match-meta {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255,255,255,0.02);
+    }
+    .confidence-bar-wrap {
+      flex: 1;
+      height: 4px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+    }
+    .confidence-bar { height: 100%; background: var(--green); border-radius: 2px; transition: width 0.4s; }
+    .confidence-label { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .method-badge {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      padding: 2px 7px;
+      border-radius: 4px;
+      background: rgba(255,255,255,0.07);
+      color: var(--muted);
+      text-transform: uppercase;
+    }
+    .opposites-badge {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      padding: 2px 7px;
+      border-radius: 4px;
+      background: rgba(239,68,68,0.15);
+      color: var(--red);
+      text-transform: uppercase;
+    }
+
+    .market-pair {
+      display: grid;
+      grid-template-columns: 1fr 1px 1fr;
+    }
+    .divider { background: var(--border); }
+
+    .market-cell { padding: 14px; }
+
+    .venue-badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      padding: 2px 8px;
+      border-radius: 4px;
+      margin-bottom: 8px;
+    }
+    .badge-kalshi    { background: rgba(124,58,237,0.2); color: var(--kalshi); }
+    .badge-polymarket { background: rgba(14,165,233,0.2); color: var(--poly); }
+
+    .market-title {
+      font-size: 12px;
+      line-height: 1.5;
+      margin-bottom: 10px;
+      color: var(--text);
+    }
+
+    .market-stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .stat { display: flex; flex-direction: column; gap: 2px; }
+    .stat-label { font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--muted); }
+    .stat-value { font-size: 13px; font-weight: 600; }
+    .stat-value.price { color: var(--green); }
+    .stat-value.spread { color: var(--yellow); }
+
+    /* ── Route panel ── */
+    .route-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 24px;
+    }
+    .route-panel h2 { font-size: 13px; font-weight: 600; margin-bottom: 16px; }
+    .route-controls { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .route-controls label { color: var(--muted); font-size: 11px; }
+
+    select {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 12px;
+      padding: 8px 12px;
+      outline: none;
+      cursor: pointer;
+    }
+    select:focus { border-color: var(--accent); }
+
+    input[type="number"] {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 12px;
+      padding: 8px 12px;
+      outline: none;
+      width: 100px;
+    }
+    input[type="number"]:focus { border-color: var(--accent); }
+
+    .selected-market-note {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 8px;
+      font-style: italic;
+    }
+
+    /* ── Decision panel ── */
+    .decision-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .decision-header {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .decision-header h2 { font-size: 13px; font-weight: 600; }
+    .recommended-venue {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 3px 10px;
+      border-radius: 5px;
+    }
+    .recommended-kalshi    { background: rgba(124,58,237,0.25); color: var(--kalshi); }
+    .recommended-polymarket { background: rgba(14,165,233,0.25); color: var(--poly); }
+    .confidence-text { margin-left: auto; color: var(--muted); font-size: 11px; }
+
+    .decision-body { padding: 20px; }
+    .reasoning-text {
+      font-size: 12px;
+      color: var(--text);
+      line-height: 1.7;
+      margin-bottom: 20px;
+      padding: 12px;
+      background: rgba(255,255,255,0.03);
+      border-radius: var(--radius);
+      border-left: 3px solid var(--accent);
+    }
+
+    /* ── Score table ── */
+    .score-table { width: 100%; border-collapse: collapse; margin-bottom: 16px; font-size: 12px; }
+    .score-table th {
+      text-align: left;
+      padding: 6px 12px;
+      color: var(--muted);
+      font-size: 10px;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+    }
+    .score-table td { padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,0.04); }
+    .score-table tr:last-child td { border-bottom: none; }
+    .score-table .metric-name { color: var(--muted); }
+    .score-winner { font-weight: 700; color: var(--green); }
+    .score-bar-cell { width: 80px; }
+    .score-bar-wrap { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+    .score-bar { height: 100%; border-radius: 2px; background: var(--accent); }
+    .score-bar.winner-bar { background: var(--green); }
+
+    /* ── Warnings ── */
+    .warnings { display: flex; flex-direction: column; gap: 6px; }
+    .warning-item {
+      font-size: 11px;
+      color: var(--yellow);
+      background: rgba(251,191,36,0.08);
+      border: 1px solid rgba(251,191,36,0.2);
+      border-radius: 5px;
+      padding: 8px 12px;
+      line-height: 1.5;
+    }
+    .warning-item::before { content: '⚠ '; }
+
+    /* ── Status message ── */
+    .status-msg {
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+      padding: 40px 0;
+    }
+    .loading { color: var(--accent); }
+    .error-msg { color: var(--red); }
+
+    /* ── Spinner ── */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      display: inline-block;
+      width: 14px; height: 14px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+      margin-right: 6px;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="health-dot" id="healthDot" title="Server health"></div>
+  <h1>PROJECT EQUINOX</h1>
+  <p>Cross-Venue Prediction Market Aggregation &amp; Routing</p>
+</header>
+
+<main>
+
+  <!-- Search -->
+  <div class="search-row">
+    <input type="text" id="query" placeholder="Search markets — e.g. 2026 midterm elections" />
+    <button id="searchBtn" onclick="doSearch()">Search</button>
+  </div>
+
+  <!-- Results -->
+  <div id="resultsSection" style="display:none">
+    <div class="section-heading">Matched Market Pairs</div>
+    <div id="resultsList" class="results-list"></div>
+  </div>
+
+  <!-- Route panel -->
+  <div id="routePanel" class="route-panel" style="display:none">
+    <h2>Route Order</h2>
+    <div class="route-controls">
+      <label>Side</label>
+      <select id="side">
+        <option value="yes">Yes</option>
+        <option value="no">No</option>
+      </select>
+      <label>Size ($)</label>
+      <input type="number" id="size" value="500" min="1" step="50" />
+      <button onclick="doRoute()">Route →</button>
+    </div>
+    <div class="selected-market-note" id="selectedNote"></div>
+  </div>
+
+  <!-- Decision -->
+  <div id="decisionSection" style="display:none">
+    <div class="section-heading">Routing Decision</div>
+    <div id="decisionPanel" class="decision-panel"></div>
+  </div>
+
+</main>
+
+<script>
+  // ── State ──────────────────────────────────────────────────────────────────
+  let selectedMatch = null;
+
+  // ── Health check ──────────────────────────────────────────────────────────
+  async function checkHealth() {
+    const dot = document.getElementById('healthDot');
+    try {
+      const res = await fetch('/health');
+      const data = await res.json();
+      dot.className = 'health-dot ' + (data.status === 'ok' ? 'ok' : 'error');
+      dot.title = data.status === 'ok' ? 'Server healthy' : 'Server error';
+    } catch {
+      dot.className = 'health-dot error';
+      dot.title = 'Server unreachable';
+    }
+  }
+
+  // ── Search ─────────────────────────────────────────────────────────────────
+  async function doSearch() {
+    const query = document.getElementById('query').value.trim();
+    if (!query) return;
+
+    const btn = document.getElementById('searchBtn');
+    btn.disabled = true;
+    btn.textContent = 'Searching…';
+
+    selectedMatch = null;
+    document.getElementById('routePanel').style.display = 'none';
+    document.getElementById('decisionSection').style.display = 'none';
+
+    const list = document.getElementById('resultsList');
+    list.innerHTML = '<div class="status-msg loading"><span class="spinner"></span>Fetching from Kalshi &amp; Polymarket…</div>';
+    document.getElementById('resultsSection').style.display = 'block';
+
+    try {
+      const res = await fetch('/search?q=' + encodeURIComponent(query));
+      if (!res.ok) {
+        const err = await res.json();
+        list.innerHTML = '<div class="status-msg error-msg">Error: ' + escHtml(err.error || res.statusText) + '</div>';
+        return;
+      }
+      const matches = await res.json();
+      renderMatches(matches);
+    } catch (e) {
+      list.innerHTML = '<div class="status-msg error-msg">Request failed: ' + escHtml(e.message) + '</div>';
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Search';
+    }
+  }
+
+  // Enter key triggers search
+  document.getElementById('query').addEventListener('keydown', e => {
+    if (e.key === 'Enter') doSearch();
+  });
+
+  // ── Render match list ──────────────────────────────────────────────────────
+  function renderMatches(matches) {
+    const list = document.getElementById('resultsList');
+    if (!matches || matches.length === 0) {
+      list.innerHTML = '<div class="status-msg">No equivalent markets found. Try a different query.</div>';
+      return;
+    }
+
+    list.innerHTML = matches.map((m, i) => matchCard(m, i)).join('');
+  }
+
+  function matchCard(m, idx) {
+    const a = m.MarketA;
+    const b = m.MarketB;
+    const conf = (m.Confidence * 100).toFixed(0);
+    const isOpp = m.AreOpposites;
+
+    const oppBadge = isOpp
+      ? '<span class="opposites-badge">⇄ Opposites</span>'
+      : '';
+
+    return `
+      <div class="match-card${isOpp ? ' opposites' : ''}" id="card-${idx}" onclick="selectMatch(${idx})" data-idx="${idx}">
+        <div class="match-meta">
+          <span class="method-badge">${escHtml(m.Method)}</span>
+          <div class="confidence-bar-wrap">
+            <div class="confidence-bar" style="width:${conf}%"></div>
+          </div>
+          <span class="confidence-label">${conf}% confidence</span>
+          ${oppBadge}
+        </div>
+        <div class="market-pair">
+          ${marketCell(a)}
+          <div class="divider"></div>
+          ${marketCell(b)}
+        </div>
+      </div>`;
+  }
+
+  function marketCell(m) {
+    const venue = m.Venue || 'unknown';
+    const badgeClass = venue === 'kalshi' ? 'badge-kalshi' : 'badge-polymarket';
+    const mid = fmt2(m.YesMid * 100) + '¢';
+    const spread = fmt4(m.Spread);
+    const liq = fmtCurrency(m.Liquidity);
+    const vol = fmtCurrency(m.Volume24h);
+    const status = (m.Status || 'unknown').toUpperCase();
+
+    return `
+      <div class="market-cell">
+        <span class="venue-badge ${badgeClass}">${escHtml(venue)}</span>
+        <div class="market-title">${escHtml(m.Title)}</div>
+        <div class="market-stats">
+          <div class="stat">
+            <span class="stat-label">Yes Mid</span>
+            <span class="stat-value price">${mid}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Spread</span>
+            <span class="stat-value spread">${spread}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Liquidity</span>
+            <span class="stat-value">${liq}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Vol 24h</span>
+            <span class="stat-value">${vol}</span>
+          </div>
+          <div class="stat">
+            <span class="stat-label">Status</span>
+            <span class="stat-value" style="font-size:10px;color:var(--muted)">${status}</span>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // ── Select a match for routing ────────────────────────────────────────────
+  let _matches = [];
+
+  // Patch renderMatches to store matches
+  const _origRenderMatches = renderMatches;
+  window.renderMatches = function(matches) {
+    _matches = matches || [];
+    _origRenderMatches(matches);
+  };
+
+  function selectMatch(idx) {
+    // Deselect previous
+    document.querySelectorAll('.match-card').forEach(c => c.classList.remove('selected'));
+    const card = document.getElementById('card-' + idx);
+    if (card) card.classList.add('selected');
+
+    selectedMatch = _matches[idx];
+    if (!selectedMatch) return;
+
+    const a = selectedMatch.MarketA;
+    const note = document.getElementById('selectedNote');
+    note.textContent = 'Selected: ' + (a.Title || a.VenueID || a.ID);
+
+    document.getElementById('routePanel').style.display = 'block';
+    document.getElementById('decisionSection').style.display = 'none';
+    document.getElementById('routePanel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  // ── Route ──────────────────────────────────────────────────────────────────
+  async function doRoute() {
+    if (!selectedMatch) return;
+
+    const side = document.getElementById('side').value;
+    const size = parseFloat(document.getElementById('size').value);
+    if (!size || size <= 0) {
+      alert('Enter a positive order size.');
+      return;
+    }
+
+    const marketId = selectedMatch.MarketA.ID;
+    const decSection = document.getElementById('decisionSection');
+    const decPanel   = document.getElementById('decisionPanel');
+
+    decPanel.innerHTML = '<div class="status-msg loading"><span class="spinner"></span>Computing routing decision…</div>';
+    decSection.style.display = 'block';
+
+    try {
+      const res = await fetch('/route', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ market_id: marketId, side, size })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        decPanel.innerHTML = '<div class="status-msg error-msg" style="padding:20px">Error: ' + escHtml(data.error || res.statusText) + '</div>';
+        return;
+      }
+      renderDecision(data);
+    } catch (e) {
+      decPanel.innerHTML = '<div class="status-msg error-msg" style="padding:20px">Request failed: ' + escHtml(e.message) + '</div>';
+    }
+
+    decSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+
+  // ── Render decision ────────────────────────────────────────────────────────
+  function renderDecision(d) {
+    const panel = document.getElementById('decisionPanel');
+    const venue = d.RecommendedVenue || 'unknown';
+    const venueClass = venue === 'kalshi' ? 'recommended-kalshi' : 'recommended-polymarket';
+    const confPct = ((d.Confidence || 0) * 100).toFixed(0);
+
+    const scores = (d.VenueScores || []);
+    const winner = venue;
+
+    const scoresHtml = renderScoreTable(scores, winner);
+    const warningsHtml = renderWarnings(d.Warnings || []);
+
+    panel.innerHTML = `
+      <div class="decision-header">
+        <h2>Routing Decision</h2>
+        <span class="recommended-venue ${venueClass}">${escHtml(venue)}</span>
+        <span class="confidence-text">confidence ${confPct}%</span>
+      </div>
+      <div class="decision-body">
+        <div class="reasoning-text">${escHtml(d.Reasoning || 'No reasoning provided.')}</div>
+        ${scoresHtml}
+        ${warningsHtml}
+      </div>`;
+  }
+
+  function renderScoreTable(scores, winner) {
+    if (!scores.length) return '';
+
+    const metrics = [
+      { key: 'PriceScore',     label: 'Price',     weight: '40%' },
+      { key: 'LiquidityScore', label: 'Liquidity', weight: '35%' },
+      { key: 'SpreadScore',    label: 'Spread',     weight: '25%' },
+      { key: 'TotalScore',     label: 'Total',      weight: '—'   },
+    ];
+
+    const headers = scores.map(s => {
+      const isWin = s.Venue === winner;
+      const cls = isWin ? (s.Venue === 'kalshi' ? 'recommended-kalshi' : 'recommended-polymarket') : '';
+      return `<th><span class="recommended-venue ${cls}" style="font-size:10px">${escHtml(s.Venue)}</span></th>`;
+    }).join('');
+
+    const rows = metrics.map(m => {
+      const vals = scores.map(s => {
+        const raw = s[m.key] || 0;
+        const isWin = s.Venue === winner;
+        const barClass = isWin ? 'score-bar winner-bar' : 'score-bar';
+        const valClass = isWin && m.key === 'TotalScore' ? 'score-winner' : '';
+        return `
+          <td class="${valClass}">${(raw * 100).toFixed(1)}</td>
+          <td class="score-bar-cell">
+            <div class="score-bar-wrap"><div class="${barClass}" style="width:${(raw*100).toFixed(0)}%"></div></div>
+          </td>`;
+      }).join('');
+      return `<tr>
+        <td class="metric-name">${m.label}</td>
+        <td style="color:var(--muted);font-size:10px">${m.weight}</td>
+        ${vals}
+      </tr>`;
+    }).join('');
+
+    return `
+      <table class="score-table">
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>Weight</th>
+            ${headers}
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  }
+
+  function renderWarnings(warnings) {
+    if (!warnings.length) return '';
+    const items = warnings.map(w => `<div class="warning-item">${escHtml(w)}</div>`).join('');
+    return `<div class="warnings">${items}</div>`;
+  }
+
+  // ── Utilities ──────────────────────────────────────────────────────────────
+  function escHtml(s) {
+    if (s == null) return '';
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function fmt2(n)  { return (n == null ? '—' : (+n).toFixed(2)); }
+  function fmt4(n)  { return (n == null ? '—' : (+n).toFixed(4)); }
+  function fmtCurrency(n) {
+    if (n == null || n === 0) return '—';
+    if (n >= 1_000_000) return '$' + (n / 1_000_000).toFixed(1) + 'M';
+    if (n >= 1_000)     return '$' + (n / 1_000).toFixed(1) + 'K';
+    return '$' + (+n).toFixed(0);
+  }
+
+  // ── Boot ───────────────────────────────────────────────────────────────────
+  checkHealth();
+  setInterval(checkHealth, 30_000);
+</script>
+
+</body>
+</html>

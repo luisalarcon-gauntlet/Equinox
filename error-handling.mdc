@@ -1,0 +1,125 @@
+---
+description: Error handling rules for Project Equinox
+globs: **/*.go
+---
+
+# Error Handling Rules — Project Equinox
+
+## The EquinoxError Struct
+Every error in this system must use EquinoxError. This is non-negotiable.
+
+```go
+// Definition lives in errors/errors.go
+type EquinoxError struct {
+    Layer   string // "connector", "normalizer", "equivalence", "ai", "routing", "server"
+    Venue   string // "kalshi", "polymarket", "anthropic", "" (empty if not venue-specific)
+    Message string // human readable description of what failed
+    Err     error  // the underlying error (can be nil)
+}
+
+func (e *EquinoxError) Error() string {
+    if e.Err != nil {
+        return fmt.Sprintf("[%s][%s] %s: %v", e.Layer, e.Venue, e.Message, e.Err)
+    }
+    return fmt.Sprintf("[%s][%s] %s", e.Layer, e.Venue, e.Message)
+}
+
+func (e *EquinoxError) Unwrap() error {
+    return e.Err
+}
+```
+
+## Layer Values — Use These Exactly
+- "connector" — venue API calls (Kalshi, Polymarket)
+- "normalizer" — adapter transformations
+- "equivalence" — heuristic matching
+- "ai" — Anthropic API calls and tool execution
+- "routing" — routing engine scoring and decisions
+- "server" — HTTP handler errors
+- "config" — configuration loading
+
+## Venue Values — Use These Exactly
+- "kalshi" — Kalshi-specific errors
+- "polymarket" — Polymarket-specific errors
+- "anthropic" — Anthropic API errors
+- "" — errors not specific to a venue
+
+## Error Checkpoints — Required at Every Critical Point
+
+### Venue Connector Checkpoints
+```go
+// 1. HTTP request creation fails
+// 2. HTTP request execution fails (network error, timeout)
+// 3. Non-200 status code returned
+// 4. Response body read fails
+// 5. JSON unmarshal fails
+// 6. Required fields missing after unmarshal
+```
+
+### Normalizer Checkpoints
+```go
+// 1. Price outside valid range (0.0 to 1.0)
+// 2. Date parsing fails
+// 3. Required canonical fields cannot be populated
+// 4. Venue ID is empty
+```
+
+### Equivalence Detector Checkpoints
+```go
+// 1. Empty market list passed in
+// 2. Individual tool execution fails
+// 3. AI layer returns malformed response
+// 4. Confidence score outside 0-1 range
+```
+
+### AI Layer Checkpoints
+```go
+// 1. Anthropic API call fails
+// 2. Response content is empty
+// 3. Tool result cannot be parsed
+// 4. Confidence score missing from response
+// 5. API key not set in environment
+```
+
+### Routing Engine Checkpoints
+```go
+// 1. No venues available for market
+// 2. Liquidity data missing (warn, don't fail)
+// 3. Score calculation produces NaN or Inf
+// 4. All venues have equal scores (tie handling)
+```
+
+## Warn vs Error Decision
+- Use Error when: the operation cannot continue
+- Use Warn when: the operation can continue in a degraded state
+
+```go
+// ERROR — cannot continue
+if resp.StatusCode != 200 {
+    logger.Error("connector", "kalshi", "API unavailable", err)
+    return nil, &EquinoxError{...}
+}
+
+// WARN — continue with caveat
+if market.FetchedAt.Before(time.Now().Add(-2 * time.Minute)) {
+    logger.Warn("routing", "kalshi", "price data is stale", nil)
+    decision.Warnings = append(decision.Warnings, "Kalshi price data may be stale")
+}
+```
+
+## Never Do These
+```go
+// NEVER swallow errors
+result, _ := someOperation()
+
+// NEVER panic
+if err != nil {
+    panic(err)
+}
+
+// NEVER return raw errors
+return nil, err
+
+// NEVER return generic fmt.Errorf without EquinoxError
+return nil, fmt.Errorf("something failed")
+```

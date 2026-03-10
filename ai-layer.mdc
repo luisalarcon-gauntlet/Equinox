@@ -1,0 +1,193 @@
+---
+description: Anthropic AI layer rules for equivalence detection tools
+globs: ai/**/*.go, equivalence/tools/**/*.go
+---
+
+# AI Layer Rules — Project Equinox
+
+## When AI Layer Is Used
+The AI layer is ONLY called when the heuristic layer confidence is below the threshold (0.80).
+Never call the AI layer directly without running heuristics first.
+Never use the AI layer for routing decisions — only for equivalence detection.
+
+## Anthropic API Setup
+- Model: claude-sonnet-4-20250514
+- API Key: loaded from environment variable ANTHROPIC_API_KEY
+- Never hardcode the API key
+- Always use context for cancellation
+
+```go
+type AnthropicClient struct {
+    apiKey     string
+    httpClient *http.Client
+    logger     *logger.Logger
+}
+
+func NewAnthropicClient(cfg *config.Config, log *logger.Logger) (*AnthropicClient, error) {
+    if cfg.AnthropicAPIKey == "" {
+        return nil, &equinoxerrors.EquinoxError{
+            Layer:   "ai",
+            Venue:   "anthropic",
+            Message: "ANTHROPIC_API_KEY environment variable not set",
+        }
+    }
+    return &AnthropicClient{
+        apiKey: cfg.AnthropicAPIKey,
+        httpClient: &http.Client{Timeout: 30 * time.Second},
+        logger: log,
+    }, nil
+}
+```
+
+## Tool Definitions
+The AI layer uses Claude with tools. Each tool is a discrete check.
+Tools are defined as structs that implement the Tool interface.
+
+```go
+type Tool interface {
+    Name()        string
+    Description() string
+    Execute(marketA, marketB models.Market) (ToolResult, error)
+}
+
+type ToolResult struct {
+    ToolName   string
+    Result     bool
+    Confidence float64
+    Reasoning  string
+}
+```
+
+## The Five Tools — Implement Each Exactly
+
+### check_opposites
+Detects when two markets are mirror images of the same event.
+Examples: "Will GOP win?" vs "Will Democrats win?" on the same race.
+Examples: "Will price exceed $X?" vs "Will price fall below $X?"
+
+### check_synonyms
+Detects equivalent terminology between markets.
+Synonym map must include at minimum:
+- GOP = Republicans = Republican Party
+- Dems = Democrats = Democratic Party
+- Fed = Federal Reserve
+- BTC = Bitcoin
+- ETH = Ethereum
+- US = United States = America
+
+### check_entity_match
+Extracts named entities from both titles and scores overlap.
+Entities: person names, organization names, numbers, years, prices.
+High overlap = likely same event.
+
+### check_date_alignment
+Compares resolution dates between markets.
+Within 1 day = high confidence match.
+Within 7 days = medium confidence match.
+More than 7 days apart = likely different events.
+
+### check_structural_equivalence
+Compares question structure.
+"Will X happen by Y?" and "Does X occur before Y?" are structurally equivalent.
+
+## Claude Tool Call Pattern
+
+```go
+func (c *AnthropicClient) EvaluateEquivalence(
+    ctx context.Context,
+    marketA models.Market,
+    marketB models.Market,
+    toolResults []ToolResult,
+) (EquivalenceResult, error) {
+
+    c.logger.Info("ai", "anthropic", fmt.Sprintf(
+        "evaluating equivalence: '%s' vs '%s'",
+        marketA.Title, marketB.Title,
+    ))
+
+    prompt := buildEquivalencePrompt(marketA, marketB, toolResults)
+
+    result, err := c.complete(ctx, prompt)
+    if err != nil {
+        c.logger.Error("ai", "anthropic", "equivalence evaluation failed", err)
+        return EquivalenceResult{}, err
+    }
+
+    parsed, err := parseEquivalenceResult(result)
+    if err != nil {
+        c.logger.Error("ai", "anthropic", "failed to parse response", err)
+        return EquivalenceResult{}, err
+    }
+
+    c.logger.Info("ai", "anthropic", fmt.Sprintf(
+        "equivalence result: %v (confidence: %.2f)",
+        parsed.IsEquivalent, parsed.Confidence,
+    ))
+
+    return parsed, nil
+}
+```
+
+## Prompt Template
+The prompt must include tool results so Claude has context:
+
+```go
+func buildEquivalencePrompt(a, b models.Market, toolResults []ToolResult) string {
+    return fmt.Sprintf(`You are an equivalence detection agent for prediction markets.
+
+Market A: "%s" (venue: %s, resolves: %s)
+Market B: "%s" (venue: %s, resolves: %s)
+
+Tool Results:
+%s
+
+Based on these tool results, determine if Market A and Market B refer to the same
+real-world event or outcome. Consider that they may be:
+1. Identical questions worded differently
+2. Opposite sides of the same event (one YES = other NO)
+3. Completely unrelated
+
+Respond in JSON only:
+{
+  "is_equivalent": true/false,
+  "are_opposites": true/false,
+  "confidence": 0.0-1.0,
+  "reasoning": "brief explanation"
+}`,
+        a.Title, a.Venue, a.ResolvesAt.Format("2006-01-02"),
+        b.Title, b.Venue, b.ResolvesAt.Format("2006-01-02"),
+        formatToolResults(toolResults),
+    )
+}
+```
+
+## Response Parsing
+Always parse Claude's JSON response safely:
+
+```go
+type EquivalenceResult struct {
+    IsEquivalent bool    `json:"is_equivalent"`
+    AreOpposites bool    `json:"are_opposites"`
+    Confidence   float64 `json:"confidence"`
+    Reasoning    string  `json:"reasoning"`
+    UsedAILayer  bool    // always true when this struct comes from AI
+}
+```
+
+## Fallback Behavior
+If the AI layer fails for any reason, the system must degrade gracefully:
+
+```go
+aiResult, err := c.aiClient.EvaluateEquivalence(ctx, marketA, marketB, toolResults)
+if err != nil {
+    // Log the failure
+    c.logger.Warn("equivalence", "anthropic", "AI layer unavailable, using heuristic only", err)
+    // Return heuristic result with warning
+    return MatchResult{
+        IsMatch:    heuristicResult.Confidence >= FallbackThreshold,
+        Confidence: heuristicResult.Confidence,
+        Method:     "heuristic-only",
+        Warnings:   []string{"AI layer unavailable — result based on heuristics only"},
+    }, nil
+}
+```

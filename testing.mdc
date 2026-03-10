@@ -1,0 +1,226 @@
+---
+description: TDD rules and testing patterns for Project Equinox
+globs: **/*_test.go
+---
+
+# Testing Rules — Project Equinox (AI TDD)
+
+## TDD is Strictly Enforced
+1. Write the test file FIRST
+2. Run the test — it must FAIL (red)
+3. Write the implementation to make it pass (green)
+4. Refactor if needed
+5. Never write implementation before tests exist
+
+## Test File Structure
+Every test file uses table-driven tests. This is the Go standard.
+
+```go
+func TestHeuristicMatchesSimilarTitles(t *testing.T) {
+    tests := []struct {
+        name       string
+        marketA    models.Market
+        marketB    models.Market
+        wantMatch  bool
+        wantMinConf float64
+    }{
+        {
+            name: "identical titles match",
+            marketA: models.Market{Title: "will democrats control the house 2026"},
+            marketB: models.Market{Title: "will democrats control the house 2026"},
+            wantMatch:   true,
+            wantMinConf: 0.95,
+        },
+        {
+            name: "similar wording same event matches",
+            marketA: models.Market{Title: "democrats win house majority 2026"},
+            marketB: models.Market{Title: "will democrats control house after midterms 2026"},
+            wantMatch:   true,
+            wantMinConf: 0.75,
+        },
+        {
+            name: "unrelated events do not match",
+            marketA: models.Market{Title: "will bitcoin exceed 100k in 2026"},
+            marketB: models.Market{Title: "will democrats control house 2026"},
+            wantMatch:   false,
+            wantMinConf: 0.0,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            result := heuristic.Match(tt.marketA, tt.marketB)
+            if result.IsMatch != tt.wantMatch {
+                t.Errorf("Match() = %v, want %v", result.IsMatch, tt.wantMatch)
+            }
+            if tt.wantMatch && result.Confidence < tt.wantMinConf {
+                t.Errorf("Confidence = %v, want >= %v", result.Confidence, tt.wantMinConf)
+            }
+        })
+    }
+}
+```
+
+## Required Test Cases Per Layer
+
+### venues/kalshi/client_test.go
+```
+TestKalshiFetchReturnsMarkets           — happy path, valid response
+TestKalshiFetchHandlesTimeout           — context deadline exceeded
+TestKalshiFetchHandlesNon200            — API returns 429, 500 etc
+TestKalshiFetchHandlesMalformedJSON     — response is not valid JSON
+TestKalshiFetchHandlesEmptyResponse     — API returns empty market list
+```
+
+### venues/kalshi/adapter_test.go
+```
+TestKalshiAdapterNormalizesPrice        — yes_bid/yes_ask → YesBid/YesAsk
+TestKalshiAdapterCalculatesSpread       — YesAsk - YesBid = Spread
+TestKalshiAdapterCalculatesMidpoint     — (YesBid + YesAsk) / 2 = YesMid
+TestKalshiAdapterHandlesMissingFields   — graceful handling of null fields
+TestKalshiAdapterParsesDate             — close_time string → time.Time
+TestKalshiAdapterSetsVenue              — Venue field = "kalshi"
+TestKalshiAdapterPreservesRawData       — RawData is populated
+TestKalshiAdapterSetsCategory           — Category field populated
+```
+
+### venues/polymarket/client_test.go
+```
+TestPolymarketFetchReturnsMarkets
+TestPolymarketFetchHandlesTimeout
+TestPolymarketFetchHandlesNon200
+TestPolymarketFetchHandlesMalformedJSON
+TestPolymarketFetchHandlesEmptyResponse
+```
+
+### venues/polymarket/adapter_test.go
+```
+TestPolymarketAdapterNormalizesPrice    — outcomePrices[0] string → float64
+TestPolymarketAdapterCalculatesSpread
+TestPolymarketAdapterHandlesMissingFields
+TestPolymarketAdapterParsesDate         — endDate string → time.Time
+TestPolymarketAdapterSetsVenue          — Venue field = "polymarket"
+TestPolymarketAdapterPreservesRawData
+TestPolymarketAdapterExtractsCategory   — from tags array
+```
+
+### equivalence/heuristic_test.go
+```
+TestHeuristicMatchesIdenticalTitles
+TestHeuristicMatchesSimilarTitles
+TestHeuristicRejectsUnrelatedMarkets
+TestHeuristicRejectsDifferentDates
+TestHeuristicConfidenceIsInRange        — always 0.0 to 1.0
+TestHeuristicHighConfidenceAboveThreshold
+TestHeuristicLowConfidenceBelowThreshold
+TestHeuristicHandlesEmptyTitles
+```
+
+### equivalence/tools/check_opposites_test.go
+```
+TestCheckOppositesDetectsPartyOpposites — GOP vs Democrats same race
+TestCheckOppositesDetectsPriceOpposites — above vs below same price
+TestCheckOppositesDetectsYesNoOpposites — "will X" vs "will X fail"
+TestCheckOppositesReturnsFalseUnrelated — unrelated markets not opposites
+TestCheckOppositesConfidenceInRange
+```
+
+### equivalence/tools/check_synonyms_test.go
+```
+TestCheckSynonymsDetectsPartyNames      — GOP = Republicans
+TestCheckSynonymsDetectsFinancialTerms  — Fed = Federal Reserve
+TestCheckSynonymsCaseInsensitive
+TestCheckSynonymsReturnsFalseNoSynonyms
+```
+
+### equivalence/tools/check_date_alignment_test.go
+```
+TestCheckDateAlignmentExactMatch
+TestCheckDateAlignmentOneDayApart       — still matches
+TestCheckDateAlignmentMonthsApart       — does not match
+TestCheckDateAlignmentMissingDate       — graceful handling
+```
+
+### equivalence/tools/check_entity_match_test.go
+```
+TestCheckEntityMatchHighOverlap
+TestCheckEntityMatchLowOverlap
+TestCheckEntityMatchNoOverlap
+TestCheckEntityMatchExtractsNumbers     — prices, years
+TestCheckEntityMatchExtractsOrgs        — company names
+```
+
+### routing/engine_test.go
+```
+TestRoutingPriceAdvantageWins           — better price → that venue wins
+TestRoutingLiquidityAdvantageWins       — deeper book → that venue wins
+TestRoutingSpreadAdvantageWins          — tighter spread → that venue wins
+TestRoutingMixedSignalsProducesWarning  — conflicting metrics → warning
+TestRoutingHandlesUnavailableVenue      — one venue missing → route to other
+TestRoutingStaleDataProducesWarning     — old FetchedAt → warning in decision
+TestRoutingScoresInRange                — all scores 0.0 to 1.0
+TestRoutingDecisionHasReasoning         — Reasoning field never empty
+TestRoutingDecisionHasVenue             — RecommendedVenue never empty
+TestRoutingWeightsAddToOne              — Price+Liquidity+Spread weights = 1.0
+TestRoutingTieBreaksToHigherLiquidity   — equal scores → prefer liquidity
+```
+
+### integration/full_flow_test.go
+```
+TestFullFlowSearchAndRoute              — end to end with mock APIs
+TestFullFlowBothVenuesUnavailable       — graceful degradation
+TestFullFlowAILayerUnavailable          — falls back to heuristic only
+TestFullFlowOppositeMarketDetection     — GOP/Democrat opposite detection
+TestFullFlowNoMarketsFound              — empty results handled
+```
+
+## Mocking Pattern
+Use interfaces for all external dependencies so they can be mocked in tests.
+
+```go
+// Define interface
+type AnthropicClient interface {
+    Complete(ctx context.Context, prompt string) (string, error)
+}
+
+// Mock for tests
+type MockAnthropicClient struct {
+    Response string
+    Err      error
+}
+
+func (m *MockAnthropicClient) Complete(ctx context.Context, prompt string) (string, error) {
+    return m.Response, m.Err
+}
+```
+
+## Test Helpers
+Create test fixtures in a testdata/ folder per package.
+Create helper functions to build test markets.
+
+```go
+func testMarket(venue, title string, yesPrice float64) models.Market {
+    return models.Market{
+        ID:        "test-id",
+        Venue:     venue,
+        Title:     title,
+        YesBid:    yesPrice - 0.01,
+        YesAsk:    yesPrice + 0.01,
+        YesMid:    yesPrice,
+        NoPrice:   1.0 - yesPrice,
+        Spread:    0.02,
+        Liquidity: 100000,
+        Volume24h: 50000,
+        ResolvesAt: time.Now().Add(30 * 24 * time.Hour),
+        FetchedAt:  time.Now(),
+        Status:    "open",
+    }
+}
+```
+
+## Coverage Expectations
+- venues/ — 90%+ coverage
+- equivalence/ — 90%+ coverage
+- routing/ — 95%+ coverage
+- models/ — 100% coverage
+- errors/ — 100% coverage

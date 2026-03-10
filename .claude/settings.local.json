@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build ./...)",
+      "Bash(go test ./venues/kalshi/... -v -count=1 -run \"TestEventMatchesDiscoveryQuery\")",
+      "Bash(go test ./venues/kalshi/... ./venues/polymarket/... ./server/... ./tests/integration/... -count=1)"
+    ]
+  }
+}

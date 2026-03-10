@@ -1,0 +1,24 @@
+# Version control and IDE
+.git
+.cursor
+.cursorrules
+*.swp
+*.swo
+*~
+
+# Documentation (not needed at build or runtime)
+docs
+*.md
+
+# Local env and secrets — never bake into image
+.env
+.env.*
+!.env.example
+
+# Test and tooling output
+terminals
+agent-transcripts
+coverage.out
+*.test
+
+# Keep go.mod, go.sum, all .go source, and static/ for go:embed
