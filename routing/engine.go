@@ -184,14 +184,6 @@ func (e *Engine) Route(match models.MatchResult, side string, size float64) (mod
 
 	reasoning := e.buildReasoning(recommended, marketA, marketB, scoreA, scoreB, side, size, isTie)
 
-	if e.log != nil {
-		e.log.Info("routing", "", fmt.Sprintf(
-			"route $%.0f %s → %s (confidence %.2f | %s=%.3f %s=%.3f)",
-			size, strings.ToUpper(side), recommended.Venue, confidence,
-			marketA.Venue, scoreA.TotalScore, marketB.Venue, scoreB.TotalScore,
-		))
-	}
-
 	return models.RoutingDecision{
 		Market:           recommended,
 		OrderSide:        side,

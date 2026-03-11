@@ -7,8 +7,6 @@ import (
 	"github.com/equinox/config"
 )
 
-// setEnv sets environment variables for the duration of a test and restores
-// them via t.Cleanup.
 func setEnv(t *testing.T, pairs map[string]string) {
 	t.Helper()
 	for k, v := range pairs {
@@ -16,104 +14,44 @@ func setEnv(t *testing.T, pairs map[string]string) {
 	}
 }
 
-// minimalEnv returns the minimum set of environment variables required for
-// config.Load() to succeed. Tests that only care about one specific field
-// start from this base and add or override individual entries.
 func minimalEnv() map[string]string {
 	return map[string]string{
-		"ANTHROPIC_API_KEY":   "k",
-		"KALSHI_API_KEY_ID":   "test-key-id",
-		"KALSHI_API_KEY_PATH": "/path/to/key.pem",
+		"OPENAI_API_KEY": "k",
 	}
 }
 
 func TestLoadReturnsErrorWhenAPIKeyMissing(t *testing.T) {
-	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
 
 	_, err := config.Load()
 	if err == nil {
-		t.Error("Load() = nil error, want error when ANTHROPIC_API_KEY not set")
+		t.Error("Load() = nil error, want error when OPENAI_API_KEY not set")
 	}
 }
 
-func TestLoadReturnsErrorWhenKalshiAPIKeyIDMissing(t *testing.T) {
-	env := minimalEnv()
-	env["KALSHI_API_KEY_ID"] = ""
-	setEnv(t, env)
+func TestLoadSucceedsWithoutKalshiCredentials(t *testing.T) {
+	setEnv(t, minimalEnv())
 
-	_, err := config.Load()
-	if err == nil {
-		t.Error("Load() = nil error, want error when KALSHI_API_KEY_ID not set")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if cfg.KalshiBaseURL == "" {
+		t.Error("KalshiBaseURL should be populated by default")
 	}
 }
 
-func TestLoadReturnsErrorWhenKalshiKeyMissing(t *testing.T) {
+func TestLoadStoresOpenAIAPIKey(t *testing.T) {
 	env := minimalEnv()
-	env["KALSHI_API_KEY_PATH"] = ""
-	env["KALSHI_PRIVATE_KEY"] = ""
-	setEnv(t, env)
-
-	_, err := config.Load()
-	if err == nil {
-		t.Error("Load() = nil error, want error when KALSHI_API_KEY_PATH and KALSHI_PRIVATE_KEY not set")
-	}
-}
-
-func TestLoadSucceedsWithAPIKeySet(t *testing.T) {
-	env := minimalEnv()
-	env["ANTHROPIC_API_KEY"] = "test-key-123"
+	env["OPENAI_API_KEY"] = "test-key-123"
 	setEnv(t, env)
 
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v, want nil", err)
 	}
-	if cfg.AnthropicAPIKey != "test-key-123" {
-		t.Errorf("AnthropicAPIKey = %q, want %q", cfg.AnthropicAPIKey, "test-key-123")
-	}
-}
-
-func TestLoadStoresKalshiAPIKeyID(t *testing.T) {
-	env := minimalEnv()
-	env["KALSHI_API_KEY_ID"] = "my-kalshi-key-id"
-	setEnv(t, env)
-
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.KalshiAPIKeyID != "my-kalshi-key-id" {
-		t.Errorf("KalshiAPIKeyID = %q, want %q", cfg.KalshiAPIKeyID, "my-kalshi-key-id")
-	}
-}
-
-func TestLoadStoresKalshiAPIKeyPath(t *testing.T) {
-	env := minimalEnv()
-	env["KALSHI_API_KEY_PATH"] = "/secrets/kalshi.pem"
-	env["KALSHI_PRIVATE_KEY"] = "" // Prefer path when both could be set
-	setEnv(t, env)
-
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.KalshiAPIKeyPath != "/secrets/kalshi.pem" {
-		t.Errorf("KalshiAPIKeyPath = %q, want %q", cfg.KalshiAPIKeyPath, "/secrets/kalshi.pem")
-	}
-}
-
-func TestLoadUsesKalshiPrivateKeyWhenPathNotSet(t *testing.T) {
-	env := minimalEnv()
-	env["KALSHI_API_KEY_PATH"] = ""
-	env["KALSHI_PRIVATE_KEY"] = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----"
-	setEnv(t, env)
-
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.KalshiAPIKeyPath == "" {
-		t.Error("KalshiAPIKeyPath empty, want temp file path when KALSHI_PRIVATE_KEY set")
+	if cfg.OpenAIAPIKey != "test-key-123" {
+		t.Errorf("OpenAIAPIKey = %q, want %q", cfg.OpenAIAPIKey, "test-key-123")
 	}
 }
 
@@ -125,7 +63,7 @@ func TestLoadDefaultKalshiBaseURL(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	want := "https://api.elections.kalshi.com/trade-api/v2"
+	want := "https://api.elections.kalshi.com"
 	if cfg.KalshiBaseURL != want {
 		t.Errorf("KalshiBaseURL = %q, want %q", cfg.KalshiBaseURL, want)
 	}
@@ -199,7 +137,7 @@ func TestLoadDefaultStalenessThreshold(t *testing.T) {
 
 func TestLoadOverridesKalshiBaseURL(t *testing.T) {
 	env := minimalEnv()
-	env["KALSHI_BASE_URL"] = "https://demo.kalshi.co/trade-api/v2"
+	env["KALSHI_BASE_URL"] = "https://demo.kalshi.co"
 	setEnv(t, env)
 
 	cfg, err := config.Load()
@@ -207,7 +145,7 @@ func TestLoadOverridesKalshiBaseURL(t *testing.T) {
 		t.Fatalf("Load() error = %v", err)
 	}
 
-	want := "https://demo.kalshi.co/trade-api/v2"
+	want := "https://demo.kalshi.co"
 	if cfg.KalshiBaseURL != want {
 		t.Errorf("KalshiBaseURL = %q, want %q", cfg.KalshiBaseURL, want)
 	}
@@ -275,19 +213,17 @@ func TestLoadOverridesHTTPTimeout(t *testing.T) {
 }
 
 func TestLoadErrorWrapsAsEquinoxError(t *testing.T) {
-	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
 
 	_, err := config.Load()
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
 
-	// The error message must contain the config layer indicator.
 	errStr := err.Error()
 	if len(errStr) == 0 {
 		t.Error("error string is empty")
 	}
-	// Must contain [config] as per EquinoxError format.
 	if !contains(errStr, "[config]") {
 		t.Errorf("error %q does not contain [config]", errStr)
 	}

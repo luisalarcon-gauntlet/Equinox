@@ -13,8 +13,8 @@ venue to use for a hypothetical order based on price, liquidity, and spread.
 ## Prerequisites
 
 - **Go 1.22+** — [Download](https://go.dev/dl/)
-- **Anthropic API key** — Required for the AI fallback layer in equivalence
-  detection. Get one at [console.anthropic.com](https://console.anthropic.com).
+- **OpenAI API key** — Required for the AI fallback layer in equivalence
+  detection. Get one at [platform.openai.com](https://platform.openai.com).
 
 ---
 
@@ -26,7 +26,7 @@ cd equinox
 
 # Copy the example env file and add your API key
 cp .env.example .env
-# Edit .env and set ANTHROPIC_API_KEY=your_key_here
+# Edit .env and set OPENAI_API_KEY=your_key_here
 
 # Start the development server
 make dev
@@ -77,8 +77,7 @@ equivalence detection on all cross-venue pairs, and displays matched pairs
 side-by-side with:
 - Both market titles and venue badges
 - Yes price, spread, and liquidity for each venue
-- Match confidence and detection method (`heuristic` or `heuristic+ai`)
-- An "OPPOSITES" badge if the markets are mirror images of the same event
+- Match confidence and detection method (`heuristic_accept`, `heuristic_reject`, or `heuristic+ai`)
 
 **4. Route a hypothetical order**
 
@@ -129,8 +128,8 @@ Venue Connectors → Canonical Model → Equivalence Detector → Routing Engine
 
 3. **Equivalence Detector** (`equivalence/`) — Heuristic matcher runs first.
    If confidence ≥ 0.80, the result is returned immediately. Below that
-   threshold, five specialised tools run in parallel and Claude synthesises
-   the evidence.
+   threshold, compact deterministic tool signals are sent to OpenAI
+   `gpt-4.1-nano` for a cheap boolean match classification.
 
 4. **Routing Engine** (`routing/`) — Scores each venue on price (40%),
    liquidity (35%), and spread (25%) using cross-venue min-max normalisation.
@@ -145,23 +144,22 @@ Full documentation: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ## AI Usage Disclosure
 
-**Claude Sonnet (`claude-sonnet-4-20250514`) is used as the AI fallback layer
+**OpenAI `gpt-4.1-nano` is used as the AI fallback layer
 in equivalence detection. It is invoked only when heuristic confidence falls
 below 0.80. All AI tool calls are logged with their results and reasoning.**
 
 Specifically:
 - The heuristic layer runs on every market pair with zero API cost.
 - Only pairs that score below the 0.80 confidence threshold trigger an
-  Anthropic API call.
-- Before calling Claude, five deterministic tools run in parallel and produce
-  structured evidence (entity overlap scores, date alignment, synonym
-  detection, opposite detection, structural comparison).
-- Claude receives the pre-computed tool results and synthesises them into a
-  final equivalence decision — it is not reasoning from scratch.
-- Every AI call is logged: `[INFO][ai][anthropic] evaluating equivalence: '...' vs '...'`
+  OpenAI API call.
+- Before calling OpenAI, deterministic tools run in parallel and produce
+  compact evidence (entity overlap scores, date alignment, synonym
+  detection, structural comparison).
+- OpenAI receives the pre-computed tool results and returns a compact boolean
+  match decision with confidence — it is not reasoning from scratch.
 - The result includes the `Method` field (`"heuristic+ai"`) so every decision
   is fully attributable.
-- If the Anthropic API is unavailable, the system degrades gracefully to
+- If the OpenAI API is unavailable, the system degrades gracefully to
   heuristic-only results with a warning — it never fails silently.
 
 ---
@@ -170,7 +168,8 @@ Specifically:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | **Yes** | — | Anthropic API key for Claude |
+| `OPENAI_API_KEY` | **Yes** | — | OpenAI API key for `gpt-4.1-nano` |
+| `OPENAI_BASE_URL` | No | `https://api.openai.com/v1` | Override for testing or proxying |
 | `SERVER_PORT` | No | `8080` | HTTP server port |
 | `HTTP_TIMEOUT` | No | `10s` | Timeout for outbound HTTP calls |
 | `KALSHI_BASE_URL` | No | Kalshi production API | Override for testing |

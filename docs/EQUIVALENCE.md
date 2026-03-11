@@ -13,7 +13,7 @@ Equivalence is not a binary property — it exists on a spectrum:
 | **Identical** | "Will Democrats win the House in 2026?" (both venues) | Heuristic detects immediately |
 | **Paraphrase** | "Democrats House majority 2026" vs "Will Dems control House after midterms?" | Heuristic entity overlap |
 | **Synonymic** | "GOP control Senate" vs "Republicans Senate majority" | AI synonym tool |
-| **Opposite** | "Will Republicans win House?" vs "Will Democrats win House?" | AI opposites tool → `AreOpposites=true` |
+| **Complementary phrasing** | "Will Republicans win House?" vs "Will Democrats win House?" | AI fallback may still classify as the same underlying market |
 | **Unrelated** | "Bitcoin above $100k" vs "Democrats win House" | Both layers reject |
 
 ---
@@ -94,31 +94,12 @@ If confidence **< 0.80**, the pair is escalated to the AI tool layer.
 
 ## AI Tool Layer
 
-The AI tool layer (`equivalence/tools/`) consists of five specialised tools
-that Claude can use to gather evidence about a market pair. The tools run in
+The AI tool layer (`equivalence/tools/`) consists of specialised tools
+that provide evidence about a market pair. The tools run in
 **parallel** (goroutines) so the combined latency is bounded by the slowest
 tool rather than the sum.
 
-### Tool 1: `check_opposites`
-
-**Purpose:** Detect markets that are mirror images of the same event.
-
-**Mechanism:** Looks for antonym pairs in normalised titles:
-- Political opposites: GOP ↔ Democrats, Republican ↔ Democrat
-- Directional opposites: above ↔ below, over ↔ under, rise ↔ fall
-- Yes/No inversions: "will X happen" vs "will X fail"
-
-**Output:** `{result: bool, confidence: float64, reasoning: string}`
-
-**Example:**
-```
-Market A: "will republicans win the house in 2026"
-Market B: "will democrats control the house in 2026"
-→ result: true, confidence: 0.85
-  reasoning: "political party opposites detected (republicans/democrats)"
-```
-
-### Tool 2: `check_synonyms`
+### Tool 1: `check_synonyms`
 
 **Purpose:** Detect equivalent terminology across venues.
 
@@ -137,7 +118,7 @@ overlap → synonym match.
 
 **Output:** `{result: bool, confidence: float64, reasoning: string}`
 
-### Tool 3: `check_entity_match`
+### Tool 2: `check_entity_match`
 
 **Purpose:** Score named entity overlap with higher precision than raw token
 matching.
@@ -151,7 +132,7 @@ Entity overlap is scored as `|intersection| / |union|`.
 
 **Output:** `{result: bool, confidence: float64, reasoning: string}`
 
-### Tool 4: `check_date_alignment`
+### Tool 3: `check_date_alignment`
 
 **Purpose:** Compare resolution dates with a configurable tolerance.
 
@@ -162,7 +143,7 @@ markets).
 
 **Output:** `{result: bool, confidence: float64, reasoning: string}`
 
-### Tool 5: `check_structural`
+### Tool 4: `check_structural`
 
 **Purpose:** Compare the grammatical and logical structure of the questions.
 
@@ -194,8 +175,7 @@ Input: (marketA from Kalshi, marketB from Polymarket)
                    │ (confidence < 0.80)
                    ▼
     ┌─────────────────────────────────────────┐
-    │  Run 5 tools in parallel (goroutines)   │
-    │  check_opposites                        │
+    │  Run tools in parallel (goroutines)     │
     │  check_synonyms                         │
     │  check_entity_match                     │
     │  check_date_alignment                   │
@@ -204,18 +184,17 @@ Input: (marketA from Kalshi, marketB from Polymarket)
                    │ []ToolResult
                    ▼
     ┌──────────────────────────────────┐
-    │  Claude Synthesis                │
-    │  (claude-sonnet-4-20250514)      │
+    │  OpenAI Classification           │
+    │  (gpt-4.1-nano)                  │
     │  Prompt includes:                │
     │   - Both market titles           │
     │   - Resolution dates             │
-    │   - All 5 tool results           │
+    │   - Compact tool results         │
     └──────────────┬───────────────────┘
                    │
     ┌──────────────▼────────────────────────────────┐
     │  Parse JSON response:                          │
-    │  {is_equivalent, are_opposites,                │
-    │   confidence, reasoning}                       │
+    │  {is_match, confidence, reasoning}             │
     └──────────────┬────────────────────────────────-┘
                    │
                    ▼
@@ -224,7 +203,7 @@ Input: (marketA from Kalshi, marketB from Polymarket)
 
 ### AI Unavailability — Graceful Degradation
 
-If the Anthropic API is unavailable (network error, rate limit, timeout):
+If the OpenAI API is unavailable (network error, rate limit, timeout):
 
 1. The detector logs a warning: `"AI layer unavailable — returning heuristic-only result"`
 2. Returns the heuristic result with `Method: "heuristic-only"`
@@ -281,7 +260,7 @@ Confidence = 0.80, which exactly meets the threshold. Result: `IsMatch=true`,
 | **Different venues, same question** | Heuristic detects with very high confidence |
 | **Markets with no date** | Date score set to 0.50 (neutral), not penalised |
 | **Abbreviations** (BTC, GOP) | synonym tool replaces before comparison |
-| **Opposite markets** | Detected by `check_opposites` tool; `AreOpposites=true` in result |
-| **Homonymous entities** | Not handled — "Fed" could be Federal Reserve or Fed Cup. The AI layer's Claude reasoning mitigates this |
+| **Complementary markets** | No dedicated opposite-side field is returned; the classifier only decides whether the pair is the same underlying market |
+| **Homonymous entities** | Not handled — "Fed" could be Federal Reserve or Fed Cup. The AI layer's compact classification mitigates this |
 | **Non-English titles** | Not supported — all tooling assumes ASCII English |
 | **Scalar markets** | Kalshi scalar markets (e.g. "BTC price on Dec 31") may not match binary Polymarket markets; heuristic will likely produce low confidence, triggering AI |

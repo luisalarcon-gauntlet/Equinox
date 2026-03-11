@@ -104,9 +104,9 @@ func TestEquinoxErrorTableDriven(t *testing.T) {
 			name:        "config no venue no error",
 			layer:       "config",
 			venue:       "",
-			message:     "ANTHROPIC_API_KEY not set",
+			message:     "OPENAI_API_KEY not set",
 			err:         nil,
-			wantMessage: "[config][] ANTHROPIC_API_KEY not set",
+			wantMessage: "[config][] OPENAI_API_KEY not set",
 		},
 		{
 			name:        "normalizer kalshi with error",

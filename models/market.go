@@ -47,12 +47,26 @@ type MatchResult struct {
 	MarketA      Market
 	MarketB      Market
 	IsMatch      bool
-	AreOpposites bool    // true when the markets are mirror images (GOP win = Dem loss)
 	Confidence   float64 // 0.0 to 1.0
 	Method       string  // "heuristic", "ai", or "heuristic+ai"
 	Reasoning    string  // human-readable explanation of the decision
 	Warnings     []string
 	MatchedAt    time.Time
+}
+
+// SearchSuggestions contains the top venue-specific search results shown when
+// no cross-venue pair clears the equivalence threshold.
+type SearchSuggestions struct {
+	Kalshi     []Market `json:"kalshi"`
+	Polymarket []Market `json:"polymarket"`
+}
+
+// SearchResponse is the payload returned by GET /search.
+type SearchResponse struct {
+	Matches                 []MatchResult     `json:"matches"`
+	NoMatchesAboveThreshold bool              `json:"no_matches_above_threshold"`
+	Message                 string            `json:"message,omitempty"`
+	Suggestions             SearchSuggestions `json:"suggestions"`
 }
 
 // VenueScore is the routing engine's score for one venue on a given market.
@@ -63,6 +77,12 @@ type VenueScore struct {
 	SpreadScore    float64 // higher = tighter spread (healthier market)
 	LiquidityScore float64 // higher = deeper order book
 	TotalScore     float64 // weighted combination of the three sub-scores
+}
+
+// MarketPair groups one Kalshi market with one Polymarket market for cross-venue evaluation.
+type MarketPair struct {
+	A Market
+	B Market
 }
 
 // RoutingDecision is the full output of the routing engine for a single

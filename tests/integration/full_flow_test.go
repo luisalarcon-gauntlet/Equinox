@@ -1,27 +1,14 @@
 // Package integration contains end-to-end tests for Project Equinox.
-//
-// These tests wire up real venue clients, a real equivalence detector (with a
-// mock AI layer to avoid live Anthropic calls), a real routing engine, and a
-// real HTTP server — all connected to mock httptest.Servers that stand in for
-// the Kalshi and Polymarket APIs.
-//
-// Every test runs in isolation with fresh components and does not depend on
-// external network access or environment variables.
 package integration_test
 
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -40,11 +27,6 @@ import (
 	"github.com/equinox/venues/polymarket"
 )
 
-// ── Mock AI client ────────────────────────────────────────────────────────────
-
-// mockAIClient implements equivalence.AIEvaluator for tests.
-// It returns a fixed EquivalenceResult or an error, enabling tests to
-// exercise both the happy path and the AI-unavailable degradation path.
 type mockAIClient struct {
 	result aipackage.EquivalenceResult
 	err    error
@@ -58,51 +40,61 @@ func (m *mockAIClient) EvaluateEquivalence(
 	return m.result, m.err
 }
 
-// ── Test helpers ──────────────────────────────────────────────────────────────
+func (m *mockAIClient) EvaluateBatch(
+	_ context.Context,
+	pairs []aipackage.BatchPair,
+) ([]aipackage.EquivalenceResult, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	results := make([]aipackage.EquivalenceResult, len(pairs))
+	for i := range pairs {
+		results[i] = m.result
+	}
+	return results, nil
+}
 
-// silentLogger returns a logger that discards all output, keeping test output clean.
 func silentLogger() *logger.Logger {
 	return logger.New(io.Discard)
 }
 
-// testFS is a minimal in-memory filesystem with a placeholder index.html.
 var testFS = fstest.MapFS{
 	"index.html": {Data: []byte("<html><body>Equinox Integration Test</body></html>")},
 }
 
-// kalshiResponse builds a Kalshi GET /events JSON response with one event
-// containing one market leg. This matches the KalshiEventsResponse format
-// expected by SearchAllOpenEvents.
+// kalshiResponse builds a Kalshi GET /v1/search/series JSON response with one
+// series result containing one nested market.
 func kalshiResponse(ticker, title, status, yesBid, yesAsk, closeTime string) string {
 	return fmt.Sprintf(`{
-		"events": [{
-			"event_ticker": %q,
+		"total_results_count": 1,
+		"next_cursor": "",
+		"current_page": [{
 			"series_ticker": "HOUSE",
-			"title": %q,
+			"series_title": "US House Control",
+			"event_ticker": "HOUSE-2026",
+			"event_title": %q,
+			"event_subtitle": "Election night",
 			"category": "Politics",
+			"total_series_volume": 1000000,
+			"total_volume": 800000,
+			"total_market_count": 1,
+			"active_market_count": 1,
+			"search_score": 100,
+			"tags": ["politics","house"],
+			"topic_keywords": ["house","election","democrats"],
 			"markets": [{
 				"ticker": %q,
-				"event_ticker": %q,
-				"yes_sub_title": %q,
-				"title": %q,
+				"yes_subtitle": %q,
 				"status": %q,
 				"yes_bid_dollars": %q,
 				"yes_ask_dollars": %q,
-				"no_bid_dollars": "0.0200",
-				"no_ask_dollars": "0.0400",
-				"open_interest": 80000,
-				"open_interest_fp": "80000",
-				"volume_24h": 50000,
-				"close_time": %q
+				"volume": 50000,
+				"close_ts": %q
 			}]
-		}],
-		"cursor": ""
-	}`, "HOUSE-2026", title, ticker, "HOUSE-2026", title, title, status, yesBid, yesAsk, closeTime)
+		}]
+	}`, title, ticker, title, status, yesBid, yesAsk, closeTime)
 }
 
-// polymarketResponse builds a Polymarket /public-search JSON response with one
-// event containing one market. This matches the SearchResponse format expected
-// by SearchActiveMarkets.
 func polymarketResponse(id, question string, yesBid, yesAsk, liquidity float64, endDate string, active bool) string {
 	return fmt.Sprintf(`{
 		"events": [{
@@ -126,37 +118,6 @@ func polymarketResponse(id, question string, yesBid, yesAsk, liquidity float64, 
 	}`, question, id, active, id, question, yesBid, 1.0-yesBid, active, endDate, liquidity)
 }
 
-// generateTestKeyFile creates a temporary RSA private key PEM file for use in
-// integration tests. The file is removed automatically via t.Cleanup.
-func generateTestKeyFile(t *testing.T) (keyID, keyPath string) {
-	t.Helper()
-
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("generateTestKeyFile: rsa.GenerateKey: %v", err)
-	}
-
-	keyBytes, err := x509.MarshalPKCS8PrivateKey(privateKey)
-	if err != nil {
-		t.Fatalf("generateTestKeyFile: MarshalPKCS8PrivateKey: %v", err)
-	}
-
-	tmpFile, err := os.CreateTemp("", "equinox-integration-kalshi-key-*.pem")
-	if err != nil {
-		t.Fatalf("generateTestKeyFile: CreateTemp: %v", err)
-	}
-	t.Cleanup(func() { os.Remove(tmpFile.Name()) })
-
-	if err := pem.Encode(tmpFile, &pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes}); err != nil {
-		t.Fatalf("generateTestKeyFile: pem.Encode: %v", err)
-	}
-	tmpFile.Close()
-
-	return "integration-test-key-id", tmpFile.Name()
-}
-
-// buildServer wires up the full Equinox stack against the provided mock venue
-// HTTP servers and AI client. Returns the HTTP handler ready for httptest.
 func buildServer(
 	t *testing.T,
 	kalshiServer, polyServer *httptest.Server,
@@ -165,12 +126,9 @@ func buildServer(
 ) *server.Server {
 	t.Helper()
 
-	keyID, keyPath := generateTestKeyFile(t)
-
 	cfg := &config.Config{
-		AnthropicAPIKey:              "test-key",
-		KalshiAPIKeyID:               keyID,
-		KalshiAPIKeyPath:             keyPath,
+		OpenAIAPIKey:                 "test-key",
+		OpenAIBaseURL:                "https://api.openai.com/v1",
 		KalshiBaseURL:                kalshiServer.URL,
 		PolymarketBaseURL:            polyServer.URL,
 		HTTPTimeout:                  5 * time.Second,
@@ -192,25 +150,21 @@ func buildServer(
 	return server.NewServer(testFS, connectors, detector, engine, log)
 }
 
-// doSearch performs a GET /search?q={query} against the server and returns the
-// decoded MatchResult slice.
-func doSearch(t *testing.T, srv *server.Server, query string) []models.MatchResult {
+func doSearch(t *testing.T, srv *server.Server, query string) models.SearchResponse {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/search?q="+query, nil)
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("search: expected 200, got %d — body: %s", rec.Code, rec.Body.String())
+		t.Fatalf("search: expected 200, got %d - body: %s", rec.Code, rec.Body.String())
 	}
-	var results []models.MatchResult
-	if err := json.NewDecoder(rec.Body).Decode(&results); err != nil {
+	var resp models.SearchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("search: failed to decode response: %v", err)
 	}
-	return results
+	return resp
 }
 
-// doRoute performs a POST /route against the server and returns the decoded
-// RoutingDecision.
 func doRoute(t *testing.T, srv *server.Server, marketID, side string, size float64) (models.RoutingDecision, int) {
 	t.Helper()
 	body := map[string]any{"market_id": marketID, "side": side, "size": size}
@@ -229,31 +183,21 @@ func doRoute(t *testing.T, srv *server.Server, marketID, side string, size float
 	return decision, rec.Code
 }
 
-// ── Integration Tests ─────────────────────────────────────────────────────────
-
-// TestFullFlowSearchAndRoute runs the complete happy-path flow:
-// mock APIs → search → equivalence match → route → routing decision.
-//
-// Both venue titles are sufficiently similar for the heuristic to confirm a
-// match (entity overlap on "democrats", "control", "house", "2026" with the
-// same resolution date produces confidence ≥ 0.80).
 func TestFullFlowSearchAndRoute(t *testing.T) {
 	const closeTime = "2026-11-04T00:00:00Z"
 
-	// Kalshi mock: one matching market.
 	kalshiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, kalshiResponse(
 			"HOUSE-DEM-2026",
 			"Will Democrats control the House in 2026",
-			"active",
+			"open",
 			"0.4500", "0.4700",
 			closeTime,
 		))
 	}))
 	defer kalshiSrv.Close()
 
-	// Polymarket mock: one matching market (same event, same date, very similar title).
 	polySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, polymarketResponse(
@@ -266,19 +210,16 @@ func TestFullFlowSearchAndRoute(t *testing.T) {
 	}))
 	defer polySrv.Close()
 
-	// AI client is not expected to be called (heuristic confidence should be ≥ 0.80).
-	ai := &mockAIClient{result: aipackage.EquivalenceResult{IsEquivalent: true, Confidence: 0.95}}
+	ai := &mockAIClient{result: aipackage.EquivalenceResult{IsMatch: true, Confidence: 0.95}}
 	srv := buildServer(t, kalshiSrv, polySrv, ai, 2*time.Minute)
 
-	// Step 1: Search. Use a single keyword that's an exact substring of both
-	// venue titles (Kalshi's client-side filter uses strings.Contains).
-	results := doSearch(t, srv, "democrats")
+	resp := doSearch(t, srv, "democrats")
 
-	if len(results) == 0 {
+	if len(resp.Matches) == 0 {
 		t.Fatal("expected at least one matched market pair, got none")
 	}
 
-	match := results[0]
+	match := resp.Matches[0]
 	if !match.IsMatch {
 		t.Errorf("expected IsMatch=true, got false")
 	}
@@ -289,7 +230,6 @@ func TestFullFlowSearchAndRoute(t *testing.T) {
 		t.Error("expected both MarketA and MarketB to have IDs")
 	}
 
-	// Step 2: Route using MarketA's ID.
 	decision, code := doRoute(t, srv, match.MarketA.ID, "yes", 500)
 	if code != http.StatusOK {
 		t.Fatalf("route: expected 200, got %d", code)
@@ -308,9 +248,6 @@ func TestFullFlowSearchAndRoute(t *testing.T) {
 	}
 }
 
-// TestFullFlowBothVenuesUnavailable tests graceful degradation when both venue
-// API servers return HTTP 500. The search endpoint should still return 200 with
-// an empty result array rather than propagating the error to the caller.
 func TestFullFlowBothVenuesUnavailable(t *testing.T) {
 	kalshiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "server error", http.StatusInternalServerError)
@@ -333,39 +270,27 @@ func TestFullFlowBothVenuesUnavailable(t *testing.T) {
 		t.Fatalf("expected 200 even when both venues fail, got %d", rec.Code)
 	}
 
-	// Response must be a JSON array (possibly empty) — not an error object.
-	body := strings.TrimSpace(rec.Body.String())
-	if !strings.HasPrefix(body, "[") {
-		t.Errorf("expected JSON array response, got: %s", body)
+	var resp models.SearchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("response is not valid JSON object: %v", err)
 	}
-
-	var results []models.MatchResult
-	if err := json.NewDecoder(strings.NewReader(body)).Decode(&results); err != nil {
-		t.Fatalf("response is not valid JSON array: %v", err)
+	if len(resp.Matches) != 0 {
+		t.Errorf("expected 0 matches when both venues fail, got %d", len(resp.Matches))
 	}
-	if len(results) != 0 {
-		t.Errorf("expected 0 results when both venues fail, got %d", len(results))
+	if !resp.NoMatchesAboveThreshold {
+		t.Error("expected NoMatchesAboveThreshold=true when venues fail")
 	}
 }
 
-// TestFullFlowAILayerUnavailable verifies that when heuristic confidence is
-// below the 0.80 threshold and the AI layer returns an error, the detector
-// falls back gracefully to a heuristic-only result with a warning.
-//
-// The market titles are intentionally dissimilar (different terminology for the
-// same concept) so the heuristic produces low entity overlap (< 0.80). This
-// forces escalation to the AI layer, which then errors, triggering the fallback.
 func TestFullFlowAILayerUnavailable(t *testing.T) {
 	const closeTime = "2026-12-31T00:00:00Z"
 
-	// Use different terminology to produce low heuristic entity overlap:
-	// "btc" and "bitcoin" are different tokens from the heuristic's perspective.
 	kalshiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, kalshiResponse(
 			"BTC-100K-2026",
 			"Will BTC price exceed 100000 in 2026",
-			"active",
+			"open",
 			"0.3500", "0.3700",
 			closeTime,
 		))
@@ -384,23 +309,12 @@ func TestFullFlowAILayerUnavailable(t *testing.T) {
 	}))
 	defer polySrv.Close()
 
-	// AI layer is unavailable.
 	ai := &mockAIClient{err: fmt.Errorf("anthropic: connection refused")}
 	srv := buildServer(t, kalshiSrv, polySrv, ai, 2*time.Minute)
 
-	results := doSearch(t, srv, "btc")
+	resp := doSearch(t, srv, "btc")
 
-	// With AI down, the detector falls back to heuristic-only. The pair may or
-	// may not be returned as a match depending on whether heuristic confidence
-	// exceeds the fallback threshold (0.50). Either way the server must not
-	// crash and must return a valid JSON array.
-	if results == nil {
-		t.Fatal("expected a non-nil result slice even when AI is unavailable")
-	}
-
-	// Any matches returned under AI-unavailable conditions must have the
-	// "heuristic-only" method and carry the AI-unavailable warning.
-	for _, m := range results {
+	for _, m := range resp.Matches {
 		if m.Method != "heuristic-only" {
 			t.Errorf("expected Method='heuristic-only', got %q", m.Method)
 		}
@@ -417,14 +331,6 @@ func TestFullFlowAILayerUnavailable(t *testing.T) {
 	}
 }
 
-// TestFullFlowOppositeMarketDetection verifies that markets which represent
-// opposite sides of the same event (GOP win = Dem loss) are correctly
-// identified as equivalent with AreOpposites=true.
-//
-// Titles are designed to have moderate entity overlap so the heuristic cannot
-// confirm a match (entity score below 0.80). The mock AI client returns
-// is_equivalent=true, are_opposites=true, simulating what Claude would return
-// after seeing check_opposites detect the GOP/Democrat antonym.
 func TestFullFlowOppositeMarketDetection(t *testing.T) {
 	const closeTime = "2026-11-04T00:00:00Z"
 
@@ -433,7 +339,7 @@ func TestFullFlowOppositeMarketDetection(t *testing.T) {
 		fmt.Fprint(w, kalshiResponse(
 			"HOUSE-GOP-2026",
 			"Will Republicans win the House in 2026",
-			"active",
+			"open",
 			"0.5400", "0.5600",
 			closeTime,
 		))
@@ -452,30 +358,25 @@ func TestFullFlowOppositeMarketDetection(t *testing.T) {
 	}))
 	defer polySrv.Close()
 
-	// AI correctly identifies these as opposite sides of the same event.
 	ai := &mockAIClient{
 		result: aipackage.EquivalenceResult{
-			IsEquivalent: true,
-			AreOpposites: true,
-			Confidence:   0.88,
-			Reasoning:    "GOP win is the complement of Democrat control — mirror images of the same House outcome",
-			UsedAILayer:  true,
+			IsMatch:     true,
+			Confidence:  0.88,
+			Reasoning:   "same House control market with inverse wording",
+			UsedAILayer: true,
 		},
 	}
 	srv := buildServer(t, kalshiSrv, polySrv, ai, 2*time.Minute)
 
-	results := doSearch(t, srv, "house")
+	resp := doSearch(t, srv, "house")
 
-	if len(results) == 0 {
+	if len(resp.Matches) == 0 {
 		t.Fatal("expected at least one match for opposite market pair")
 	}
 
-	match := results[0]
+	match := resp.Matches[0]
 	if !match.IsMatch {
 		t.Errorf("expected IsMatch=true for opposite markets, got false")
-	}
-	if !match.AreOpposites {
-		t.Errorf("expected AreOpposites=true for GOP/Democrat opposite pair, got false")
 	}
 	if match.Confidence <= 0 {
 		t.Errorf("expected positive confidence, got %.2f", match.Confidence)
@@ -485,13 +386,10 @@ func TestFullFlowOppositeMarketDetection(t *testing.T) {
 	}
 }
 
-// TestFullFlowNoMarketsFound verifies that a search returning no markets from
-// either venue produces a 200 OK with an empty JSON array — not an error.
 func TestFullFlowNoMarketsFound(t *testing.T) {
-	// Both venues return valid JSON but zero markets.
 	kalshiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"events": [], "cursor": ""}`)
+		fmt.Fprint(w, `{"total_results_count":0,"next_cursor":"","current_page":[]}`)
 	}))
 	defer kalshiSrv.Close()
 
@@ -512,25 +410,21 @@ func TestFullFlowNoMarketsFound(t *testing.T) {
 		t.Fatalf("expected 200 when no markets found, got %d", rec.Code)
 	}
 
-	body := strings.TrimSpace(rec.Body.String())
-	if !strings.HasPrefix(body, "[") {
-		t.Errorf("expected JSON array response, got: %s", body)
+	var resp models.SearchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("response is not valid JSON object: %v", err)
 	}
-
-	var results []models.MatchResult
-	if err := json.NewDecoder(strings.NewReader(body)).Decode(&results); err != nil {
-		t.Fatalf("response is not valid JSON array: %v", err)
+	if len(resp.Matches) != 0 {
+		t.Errorf("expected 0 matches when no markets exist, got %d", len(resp.Matches))
 	}
-	if len(results) != 0 {
-		t.Errorf("expected 0 results when no markets exist, got %d", len(results))
+	if !resp.NoMatchesAboveThreshold {
+		t.Error("expected NoMatchesAboveThreshold=true when no markets exist")
 	}
 }
 
-// TestFullFlowHealthEndpoint checks that /health returns {"status":"ok"}
-// in a full integration context.
 func TestFullFlowHealthEndpoint(t *testing.T) {
 	kalshiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `{"events": [], "cursor": ""}`)
+		fmt.Fprint(w, `{"total_results_count":0,"next_cursor":"","current_page":[]}`)
 	}))
 	defer kalshiSrv.Close()
 	polySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -557,12 +451,6 @@ func TestFullFlowHealthEndpoint(t *testing.T) {
 	}
 }
 
-// TestFullFlowStaleDataProducesWarning verifies that routing a market with
-// data older than the staleness threshold produces a warning in the decision.
-//
-// The test uses a 10ms staleness threshold, searches to populate the cache
-// (setting FetchedAt = time.Now()), then sleeps 20ms before routing so that
-// the cached market data is provably older than the threshold.
 func TestFullFlowStaleDataProducesWarning(t *testing.T) {
 	const closeTime = "2026-11-04T00:00:00Z"
 
@@ -571,7 +459,7 @@ func TestFullFlowStaleDataProducesWarning(t *testing.T) {
 		fmt.Fprint(w, kalshiResponse(
 			"HOUSE-DEM-STALE",
 			"Will Democrats control the House in 2026",
-			"active",
+			"open",
 			"0.4500", "0.4700",
 			closeTime,
 		))
@@ -590,20 +478,18 @@ func TestFullFlowStaleDataProducesWarning(t *testing.T) {
 	}))
 	defer polySrv.Close()
 
-	ai := &mockAIClient{result: aipackage.EquivalenceResult{IsEquivalent: true, Confidence: 0.92}}
-	// 10ms staleness threshold: any data older than 10ms is stale.
+	ai := &mockAIClient{result: aipackage.EquivalenceResult{IsMatch: true, Confidence: 0.92}}
 	const staleThreshold = 10 * time.Millisecond
 	srv := buildServer(t, kalshiSrv, polySrv, ai, staleThreshold)
 
-	results := doSearch(t, srv, "democrats")
-	if len(results) == 0 {
+	searchResp := doSearch(t, srv, "democrats")
+	if len(searchResp.Matches) == 0 {
 		t.Fatal("expected at least one match")
 	}
 
-	// Sleep long enough to make the cached FetchedAt older than the threshold.
 	time.Sleep(2 * staleThreshold)
 
-	match := results[0]
+	match := searchResp.Matches[0]
 	decision, code := doRoute(t, srv, match.MarketA.ID, "yes", 500)
 	if code != http.StatusOK {
 		t.Fatalf("route: expected 200, got %d", code)
@@ -621,11 +507,9 @@ func TestFullFlowStaleDataProducesWarning(t *testing.T) {
 	}
 }
 
-// TestFullFlowRouteWithoutSearch verifies that calling /route with an unknown
-// market ID (no prior /search) returns 404.
 func TestFullFlowRouteWithoutSearch(t *testing.T) {
 	kalshiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, `{"events": [], "cursor": ""}`)
+		fmt.Fprint(w, `{"total_results_count":0,"next_cursor":"","current_page":[]}`)
 	}))
 	defer kalshiSrv.Close()
 	polySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

@@ -11,13 +11,14 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 
+	"github.com/equinox/equivalence"
 	equinoxerrors "github.com/equinox/errors"
 	"github.com/equinox/logger"
 	"github.com/equinox/models"
 	"github.com/equinox/venues"
 )
+
 
 // VenueConnector re-exports venues.VenueConnector so callers only need to
 // import the server package for dependency injection in tests.
@@ -28,6 +29,9 @@ type VenueConnector = venues.VenueConnector
 // without depending on the live detector implementation.
 type EquivalenceDetector interface {
 	Detect(ctx context.Context, marketA, marketB models.Market) (models.MatchResult, error)
+	// DetectAllPairs runs the full two-phase pipeline (heuristics → batched AI)
+	// on a pre-filtered slice of candidate pairs and returns results in the same order.
+	DetectAllPairs(ctx context.Context, pairs []models.MarketPair) ([]models.MatchResult, error)
 }
 
 // Router is the interface the server uses to produce routing decisions.
@@ -182,11 +186,12 @@ func (s *Server) handleRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSearch fetches markets from all venues in parallel, runs equivalence
-// detection on all cross-venue pairs, caches the results, and returns the
-// matched pairs as JSON.
+// detection on all cross-venue pairs, caches the results, and returns a
+// SearchResponse payload.
 //
-// Only pairs where IsMatch=true are returned; the full cross-product is
-// computed internally and filtered before the response is written.
+// When no pair clears the equivalence threshold the response has
+// NoMatchesAboveThreshold=true and the top-3 raw results from each venue
+// are included as Suggestions so the UI can ask the user to refine.
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -226,38 +231,28 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Log canonical market titles so operators can verify what the adapter
-	// layer produced from each venue's raw response.
-	for venue, markets := range venueMarkets {
-		s.log.Debug("server", venue, fmt.Sprintf(
-			"fetched %d canonical markets", len(markets)))
-		for i, m := range markets {
-			s.log.Debug("server", venue, fmt.Sprintf(
-				"  market[%d]: %q (id=%s)", i, m.Title, m.VenueID))
-		}
-	}
-
 	kalshiMarkets := venueMarkets["kalshi"]
 	polyMarkets := venueMarkets["polymarket"]
 
 	if len(kalshiMarkets) == 0 || len(polyMarkets) == 0 {
 		s.log.Warn("server", "", fmt.Sprintf(
-			"search %q: cannot pair markets (kalshi=%d polymarket=%d)",
-			query, len(kalshiMarkets), len(polyMarkets),
+			`search summary: query=%q kalshi=%d polymarket=%d matches=%d ai_calls=%d`,
+			query, len(kalshiMarkets), len(polyMarkets), 0, 0,
 		))
-		writeJSON(w, http.StatusOK, []models.MatchResult{})
+		resp := models.SearchResponse{
+			Matches:                 []models.MatchResult{},
+			NoMatchesAboveThreshold: true,
+			Message:                 "No markets found for this query on one or both venues. Please try a different search term.",
+			Suggestions: models.SearchSuggestions{
+				Kalshi:     sanitizeMarkets(top3(kalshiMarkets)),
+				Polymarket: sanitizeMarkets(top3(polyMarkets)),
+			},
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
-	// TEMPORARY DEBUG — remove before demo
-	type debugTopPairer interface {
-		DebugTopPairs(marketsA, marketsB []models.Market, topN int)
-	}
-	if dbg, ok := s.detector.(debugTopPairer); ok {
-		dbg.DebugTopPairs(kalshiMarkets, polyMarkets, 5)
-	}
-
-	matches := s.detectAllPairs(ctx, kalshiMarkets, polyMarkets)
+	matches, confirmedMatches, aiCalls := s.detectAllPairs(ctx, kalshiMarkets, polyMarkets)
 
 	// Refresh the cache: replace with results from this search.
 	s.matchMu.Lock()
@@ -269,15 +264,33 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	s.matchMu.Unlock()
 
 	s.log.Info("server", "", fmt.Sprintf(
-		"search %q: %d matches from %d kalshi × %d polymarket pairs",
-		query, len(matches), len(kalshiMarkets), len(polyMarkets),
+		`search summary: query=%q kalshi=%d polymarket=%d matches=%d ai_calls=%d`,
+		query, len(kalshiMarkets), len(polyMarkets), confirmedMatches, aiCalls,
 	))
 
 	sanitized := make([]models.MatchResult, len(matches))
 	for i, m := range matches {
 		sanitized[i] = sanitizeMatchResult(m)
 	}
-	writeJSON(w, http.StatusOK, sanitized)
+
+	var resp models.SearchResponse
+	if len(matches) == 0 {
+		resp = models.SearchResponse{
+			Matches:                 []models.MatchResult{},
+			NoMatchesAboveThreshold: true,
+			Message:                 "No confident cross-venue match found for this query. Try a more specific search term.",
+			Suggestions: models.SearchSuggestions{
+				Kalshi:     sanitizeMarkets(top3(kalshiMarkets)),
+				Polymarket: sanitizeMarkets(top3(polyMarkets)),
+			},
+		}
+	} else {
+		resp = models.SearchResponse{
+			Matches:     sanitized,
+			Suggestions: models.SearchSuggestions{},
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // candidatePair returns true when the two markets should be evaluated for
@@ -313,59 +326,32 @@ func candidatePair(a, b models.Market) bool {
 	return true
 }
 
-// detectAllPairs runs equivalence detection only on candidate pairs: same
-// ResolutionDate and, when both have Underlying set, same Underlying. All
-// other pairs are skipped so we avoid sending obviously non-equivalent pairs
-// (e.g. different dates) to the detector/AI.
+// detectAllPairs builds the cross-venue candidate set (underlying gate only),
+// then delegates to DetectAllPairs which runs heuristics and batched AI calls.
 //
-// We return all pairs that meet the equivalence benchmark (IsMatch=true). If
-// none do, we still recommend the single best pair by confidence so the user
-// gets a best-available suggestion rather than an empty list.
-func (s *Server) detectAllPairs(ctx context.Context, kalshi, polymarket []models.Market) []models.MatchResult {
-	type item struct {
-		result models.MatchResult
-	}
+// Only pairs where IsMatch=true are returned. When nothing clears the threshold
+// the caller is responsible for surfacing the raw venue results as suggestions.
+func (s *Server) detectAllPairs(ctx context.Context, kalshi, polymarket []models.Market) ([]models.MatchResult, int, int64) {
+	aiStats := equivalence.NewAIStatsCollector()
+	ctx = equivalence.WithAIStatsCollector(ctx, aiStats)
 
-	var candidateCount int
+	var pairs []models.MarketPair
 	for _, kMkt := range kalshi {
 		for _, pMkt := range polymarket {
 			if candidatePair(kMkt, pMkt) {
-				candidateCount++
+				pairs = append(pairs, models.MarketPair{A: kMkt, B: pMkt})
 			}
 		}
 	}
 
-	ch := make(chan item, candidateCount)
-	var aiPairs atomic.Int64
-	var wg sync.WaitGroup
-
-	for _, kMkt := range kalshi {
-		for _, pMkt := range polymarket {
-			if !candidatePair(kMkt, pMkt) {
-				continue
-			}
-			wg.Add(1)
-			go func(a, b models.Market) {
-				defer wg.Done()
-				result, err := s.detector.Detect(ctx, a, b)
-				if err != nil {
-					s.log.Error("server", "", "equivalence detection error", err)
-					return
-				}
-				if result.Method == "heuristic+ai" || result.Method == "heuristic-only" {
-					aiPairs.Add(1)
-				}
-				ch <- item{result: result}
-			}(kMkt, pMkt)
-		}
+	if len(pairs) == 0 {
+		return nil, 0, 0
 	}
 
-	wg.Wait()
-	close(ch)
-
-	var allResults []models.MatchResult
-	for item := range ch {
-		allResults = append(allResults, item.result)
+	allResults, err := s.detector.DetectAllPairs(ctx, pairs)
+	if err != nil {
+		s.log.Error("server", "", "DetectAllPairs failed", err)
+		return nil, 0, 0
 	}
 
 	var matches []models.MatchResult
@@ -375,28 +361,26 @@ func (s *Server) detectAllPairs(ctx context.Context, kalshi, polymarket []models
 		}
 	}
 
-	// If nothing met the benchmark, recommend the best pair we have by confidence.
-	if len(matches) == 0 && len(allResults) > 0 {
-		best := allResults[0]
-		for _, r := range allResults[1:] {
-			if r.Confidence > best.Confidence {
-				best = r
-			}
-		}
-		matches = []models.MatchResult{best}
-		s.log.Info("server", "", fmt.Sprintf(
-			"no pair above benchmark; recommending best candidate (confidence %.2f)",
-			best.Confidence,
-		))
+	return matches, len(matches), aiStats.Count()
+}
+
+// top3 returns the first n (up to 3) markets from the slice.
+func top3(markets []models.Market) []models.Market {
+	const n = 3
+	if len(markets) <= n {
+		return markets
 	}
+	return markets[:n]
+}
 
-	totalPossible := len(kalshi) * len(polymarket)
-	s.log.Info("server", "", fmt.Sprintf(
-		"equivalence funnel: %d total pairs → %d candidates (same date/underlying) → %d tier2 (AI) → %d matches",
-		totalPossible, candidateCount, aiPairs.Load(), len(matches),
-	))
-
-	return matches
+// sanitizeMarkets strips RawData from a slice of markets.
+func sanitizeMarkets(markets []models.Market) []models.Market {
+	out := make([]models.Market, len(markets))
+	for i, m := range markets {
+		m.RawData = nil
+		out[i] = m
+	}
+	return out
 }
 
 // handleRoot serves the embedded index.html for any request to "/".

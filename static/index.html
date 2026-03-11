@@ -124,8 +124,6 @@
     }
     .match-card:hover    { border-color: var(--accent); }
     .match-card.selected { border-color: var(--accent); outline: 2px solid var(--accent); outline-offset: -1px; }
-    .match-card.opposites { border-color: var(--red); }
-    .match-card.opposites.selected { outline-color: var(--red); }
 
     .match-meta {
       display: flex;
@@ -154,17 +152,6 @@
       color: var(--muted);
       text-transform: uppercase;
     }
-    .opposites-badge {
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      padding: 2px 7px;
-      border-radius: 4px;
-      background: rgba(239,68,68,0.15);
-      color: var(--red);
-      text-transform: uppercase;
-    }
-
     .market-pair {
       display: grid;
       grid-template-columns: 1fr 1px 1fr;
@@ -322,6 +309,63 @@
     }
     .warning-item::before { content: '⚠ '; }
 
+    /* ── No-match banner ── */
+    .no-match-banner {
+      background: rgba(251,191,36,0.07);
+      border: 1px solid rgba(251,191,36,0.25);
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      margin-bottom: 24px;
+    }
+    .no-match-banner h3 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--yellow);
+      margin-bottom: 6px;
+    }
+    .no-match-banner p {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    /* ── Suggestions ── */
+    .suggestions-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 16px;
+    }
+    @media (max-width: 640px) {
+      .suggestions-grid { grid-template-columns: 1fr; }
+    }
+    .suggestion-col h4 {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 10px;
+    }
+    .suggestion-col.kalshi h4   { color: var(--kalshi); }
+    .suggestion-col.poly    h4  { color: var(--poly); }
+    .suggestion-list { display: flex; flex-direction: column; gap: 8px; }
+    .suggestion-item {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+    }
+    .suggestion-item .sug-title {
+      font-size: 11px;
+      color: var(--text);
+      line-height: 1.5;
+      margin-bottom: 4px;
+    }
+    .suggestion-item .sug-meta {
+      font-size: 10px;
+      color: var(--muted);
+    }
+
     /* ── Status message ── */
     .status-msg {
       color: var(--muted);
@@ -364,8 +408,27 @@
 
   <!-- Results -->
   <div id="resultsSection" style="display:none">
-    <div class="section-heading">Matched Market Pairs</div>
-    <div id="resultsList" class="results-list"></div>
+    <!-- No-match banner + per-venue suggestions (shown when threshold not met) -->
+    <div id="noMatchBanner" class="no-match-banner" style="display:none">
+      <h3>&#9888; No confident match found</h3>
+      <p id="noMatchMsg"></p>
+      <div id="suggestionsGrid" class="suggestions-grid" style="display:none">
+        <div class="suggestion-col kalshi">
+          <h4>Kalshi — top results</h4>
+          <div id="kalshiSuggestions" class="suggestion-list"></div>
+        </div>
+        <div class="suggestion-col poly">
+          <h4>Polymarket — top results</h4>
+          <div id="polySuggestions" class="suggestion-list"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Matched pairs (shown when threshold met) -->
+    <div id="matchedSection" style="display:none">
+      <div class="section-heading">Matched Market Pairs</div>
+      <div id="resultsList" class="results-list"></div>
+    </div>
   </div>
 
   <!-- Route panel -->
@@ -422,22 +485,28 @@
     selectedMatch = null;
     document.getElementById('routePanel').style.display = 'none';
     document.getElementById('decisionSection').style.display = 'none';
+    document.getElementById('noMatchBanner').style.display = 'none';
+    document.getElementById('matchedSection').style.display = 'none';
 
+    // Show a spinner in the results area while loading.
+    const resultsSection = document.getElementById('resultsSection');
+    resultsSection.style.display = 'block';
     const list = document.getElementById('resultsList');
     list.innerHTML = '<div class="status-msg loading"><span class="spinner"></span>Fetching from Kalshi &amp; Polymarket…</div>';
-    document.getElementById('resultsSection').style.display = 'block';
 
     try {
       const res = await fetch('/search?q=' + encodeURIComponent(query));
       if (!res.ok) {
         const err = await res.json();
         list.innerHTML = '<div class="status-msg error-msg">Error: ' + escHtml(err.error || res.statusText) + '</div>';
+        document.getElementById('matchedSection').style.display = 'block';
         return;
       }
-      const matches = await res.json();
-      renderMatches(matches);
+      const resp = await res.json();
+      renderSearchResponse(resp);
     } catch (e) {
       list.innerHTML = '<div class="status-msg error-msg">Request failed: ' + escHtml(e.message) + '</div>';
+      document.getElementById('matchedSection').style.display = 'block';
     } finally {
       btn.disabled = false;
       btn.textContent = 'Search';
@@ -449,14 +518,63 @@
     if (e.key === 'Enter') doSearch();
   });
 
-  // ── Render match list ──────────────────────────────────────────────────────
+  // ── Render search response ─────────────────────────────────────────────────
+  function renderSearchResponse(resp) {
+    const matches = resp.matches || [];
+
+    if (resp.no_matches_above_threshold) {
+      // Show the no-match banner with message and per-venue suggestions.
+      const banner = document.getElementById('noMatchBanner');
+      document.getElementById('noMatchMsg').textContent =
+        (resp.message || 'No confident cross-venue match found.') +
+        ' Please try a more specific search term.';
+
+      const kSugs  = (resp.suggestions && resp.suggestions.kalshi)      || [];
+      const pSugs  = (resp.suggestions && resp.suggestions.polymarket)   || [];
+
+      if (kSugs.length > 0 || pSugs.length > 0) {
+        document.getElementById('kalshiSuggestions').innerHTML  = kSugs.map(suggestionItem).join('');
+        document.getElementById('polySuggestions').innerHTML    = pSugs.map(suggestionItem).join('');
+        document.getElementById('suggestionsGrid').style.display = 'grid';
+      } else {
+        document.getElementById('suggestionsGrid').style.display = 'none';
+      }
+
+      banner.style.display = 'block';
+      document.getElementById('matchedSection').style.display = 'none';
+      return;
+    }
+
+    // Confident matches found — show match cards.
+    document.getElementById('noMatchBanner').style.display = 'none';
+    const matchedSection = document.getElementById('matchedSection');
+    const list = document.getElementById('resultsList');
+
+    if (!matches.length) {
+      list.innerHTML = '<div class="status-msg">No equivalent markets found. Try a different query.</div>';
+    } else {
+      list.innerHTML = matches.map((m, i) => matchCard(m, i)).join('');
+    }
+    matchedSection.style.display = 'block';
+  }
+
+  function suggestionItem(m) {
+    const mid = m.YesMid ? fmt2(m.YesMid * 100) + '¢' : '—';
+    const liq = fmtCurrency(m.Liquidity);
+    return `
+      <div class="suggestion-item">
+        <div class="sug-title">${escHtml(m.Title || m.VenueID || m.ID)}</div>
+        <div class="sug-meta">Mid ${mid} &nbsp;·&nbsp; Liq ${liq}</div>
+      </div>`;
+  }
+
+  // ── Render match list (kept for _matches state used by selectMatch) ────────
   function renderMatches(matches) {
     const list = document.getElementById('resultsList');
     if (!matches || matches.length === 0) {
       list.innerHTML = '<div class="status-msg">No equivalent markets found. Try a different query.</div>';
       return;
     }
-
     list.innerHTML = matches.map((m, i) => matchCard(m, i)).join('');
   }
 
@@ -464,21 +582,15 @@
     const a = m.MarketA;
     const b = m.MarketB;
     const conf = (m.Confidence * 100).toFixed(0);
-    const isOpp = m.AreOpposites;
-
-    const oppBadge = isOpp
-      ? '<span class="opposites-badge">⇄ Opposites</span>'
-      : '';
 
     return `
-      <div class="match-card${isOpp ? ' opposites' : ''}" id="card-${idx}" onclick="selectMatch(${idx})" data-idx="${idx}">
+      <div class="match-card" id="card-${idx}" onclick="selectMatch(${idx})" data-idx="${idx}">
         <div class="match-meta">
           <span class="method-badge">${escHtml(m.Method)}</span>
           <div class="confidence-bar-wrap">
             <div class="confidence-bar" style="width:${conf}%"></div>
           </div>
           <span class="confidence-label">${conf}% confidence</span>
-          ${oppBadge}
         </div>
         <div class="market-pair">
           ${marketCell(a)}
@@ -529,11 +641,12 @@
   // ── Select a match for routing ────────────────────────────────────────────
   let _matches = [];
 
-  // Patch renderMatches to store matches
-  const _origRenderMatches = renderMatches;
-  window.renderMatches = function(matches) {
-    _matches = matches || [];
-    _origRenderMatches(matches);
+  // Keep _matches in sync: patch renderSearchResponse so the routing
+  // panel always has the current confirmed match list.
+  const _origRenderSearchResponse = renderSearchResponse;
+  window.renderSearchResponse = function(resp) {
+    _matches = (resp && resp.matches) || [];
+    _origRenderSearchResponse(resp);
   };
 
   function selectMatch(idx) {

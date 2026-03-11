@@ -15,6 +15,7 @@ import (
 	equinoxerrors "github.com/equinox/errors"
 	"github.com/equinox/logger"
 	"github.com/equinox/models"
+	"github.com/equinox/venues"
 )
 
 // PolymarketClient fetches market data from the Polymarket Gamma API and
@@ -56,8 +57,6 @@ const polyDegeneratePriceThreshold = 0.03
 // method. Markets that pass all guards but fail adaptation are logged and
 // skipped — partial results are always better than aborting the entire fetch.
 func (c *PolymarketClient) FetchMarkets(ctx context.Context, query string) ([]models.Market, error) {
-	c.log.Info("connector", "polymarket", fmt.Sprintf("fetching markets for query: %q", query))
-
 	events, err := c.SearchActiveMarkets(ctx, query)
 	if err != nil {
 		return nil, err
@@ -73,12 +72,12 @@ func (c *PolymarketClient) FetchMarkets(ctx context.Context, query string) ([]mo
 				continue
 			}
 			markets = append(markets, m)
+			if len(markets) >= venues.MaxMarketsPerVenue {
+				return markets, nil
+			}
 		}
 	}
 
-	c.log.Info("connector", "polymarket", fmt.Sprintf(
-		"fetched %d markets from %d events for query %q",
-		len(markets), len(events), query))
 	return markets, nil
 }
 
@@ -164,16 +163,10 @@ func queryFallbacks(original string) []string {
 }
 
 func (c *PolymarketClient) SearchActiveMarkets(ctx context.Context, query string) ([]Event, error) {
-	c.log.Info("connector", "polymarket",
-		fmt.Sprintf("searching active markets for query: %q", query))
-
 	filtered, err := c.searchWithFallbacks(ctx, query)
 	if err != nil {
 		return nil, err
 	}
-
-	c.log.Info("connector", "polymarket", fmt.Sprintf(
-		"SearchActiveMarkets: %d active events for query %q", len(filtered), query))
 
 	return filtered, nil
 }
@@ -183,24 +176,13 @@ func (c *PolymarketClient) SearchActiveMarkets(ctx context.Context, query string
 func (c *PolymarketClient) searchWithFallbacks(ctx context.Context, query string) ([]Event, error) {
 	queries := append([]string{query}, queryFallbacks(query)...)
 
-	for i, q := range queries {
-		if i > 0 {
-			c.log.Info("connector", "polymarket",
-				fmt.Sprintf("0 active events for %q — retrying with fallback query %q", queries[i-1], q))
-		}
-
+	for _, q := range queries {
 		events, err := c.fetchSearchPage(ctx, q)
 		if err != nil {
 			return nil, err
 		}
 
-		rawCount := len(events)
 		filtered := filterAndEnrichEvents(events, c.log)
-
-		c.log.Debug("connector", "polymarket", fmt.Sprintf(
-			"query %q: raw=%d active=%d (discarded=%d)",
-			q, rawCount, len(filtered), rawCount-len(filtered),
-		))
 
 		if len(filtered) > 0 {
 			return filtered, nil
@@ -214,8 +196,6 @@ func (c *PolymarketClient) searchWithFallbacks(ctx context.Context, query string
 // raw event slice from the response. All HTTP and JSON errors are wrapped.
 func (c *PolymarketClient) fetchSearchPage(ctx context.Context, query string) ([]Event, error) {
 	fullURL := c.buildSearchURL(query)
-	c.log.Debug("connector", "polymarket",
-		fmt.Sprintf("search request URL: %s", fullURL))
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fullURL, nil)
 	if err != nil {
@@ -275,32 +255,23 @@ func (c *PolymarketClient) buildSearchURL(query string) string {
 // event, inactive/closed market, stale year, end-date freshness, degenerate
 // price) and calls parsePrices on every surviving market. Events left with zero
 // active markets after filtering are themselves dropped.
-func filterAndEnrichEvents(events []Event, log *logger.Logger) []Event {
+func filterAndEnrichEvents(events []Event, _ *logger.Logger) []Event {
 	result := make([]Event, 0, len(events))
 	for _, ev := range events {
 		if !ev.Active {
-			log.Debug("connector", "polymarket",
-				fmt.Sprintf("skip inactive event %q", ev.Slug))
 			continue
 		}
 
 		if ev.Closed || ev.Archived {
-			log.Debug("connector", "polymarket",
-				fmt.Sprintf("skip closed/archived event %q (closed=%t archived=%t)",
-					ev.Slug, ev.Closed, ev.Archived))
 			continue
 		}
 
 		if containsStaleYear(ev.Title) {
-			log.Debug("connector", "polymarket",
-				fmt.Sprintf("skip stale-year event title %q", ev.Title))
 			continue
 		}
 
-		activeMarkets := filterAndEnrichMarkets(ev.Markets, log)
+		activeMarkets := filterAndEnrichMarkets(ev.Markets, nil)
 		if len(activeMarkets) == 0 {
-			log.Debug("connector", "polymarket",
-				fmt.Sprintf("skip event %q: no active markets remain after filtering", ev.Slug))
 			continue
 		}
 
@@ -318,7 +289,7 @@ func filterAndEnrichEvents(events []Event, log *logger.Logger) []Event {
 //  3. Safety year — title or EndDate must not reference a year < 2025.
 //  4. End-date freshness — if EndDate parses, it must not be in the past.
 //  5. Degenerate price — YesPrice must not be within 0.03 of 0 or 1.
-func filterAndEnrichMarkets(markets []Market, log *logger.Logger) []Market {
+func filterAndEnrichMarkets(markets []Market, _ *logger.Logger) []Market {
 	result := make([]Market, 0, len(markets))
 	for _, m := range markets {
 		if !m.Active {
@@ -326,32 +297,21 @@ func filterAndEnrichMarkets(markets []Market, log *logger.Logger) []Market {
 		}
 
 		if m.Closed || m.Archived {
-			log.Debug("connector", "polymarket", fmt.Sprintf(
-				"skip closed/archived market %q (closed=%t archived=%t)",
-				m.ID, m.Closed, m.Archived))
 			continue
 		}
 
 		if isMarketStale(m) {
-			log.Debug("connector", "polymarket",
-				fmt.Sprintf("skip stale-year market %q (endDate=%s)", m.ID, m.EndDate))
 			continue
 		}
 
 		if isSearchMarketEndDatePast(m) {
-			log.Debug("connector", "polymarket",
-				fmt.Sprintf("skip past-endDate market %q (endDate=%s)", m.ID, m.EndDate))
 			continue
 		}
 
 		if err := m.parsePrices(); err != nil {
-			log.Debug("connector", "polymarket",
-				fmt.Sprintf("market %q: price parse warning: %v", m.ID, err))
 		}
 
 		if m.YesPrice > 0 && (m.YesPrice <= polyDegeneratePriceThreshold || m.YesPrice >= (1.0-polyDegeneratePriceThreshold)) {
-			log.Debug("connector", "polymarket", fmt.Sprintf(
-				"skip degenerate-price market %q (yesPrice=%.4f)", m.ID, m.YesPrice))
 			continue
 		}
 

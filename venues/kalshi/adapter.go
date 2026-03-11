@@ -18,26 +18,9 @@ import (
 // UUID, which simplifies caching and deduplication.
 var marketNamespace = uuid.MustParse("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
 
-// AdaptKalshiMarket transforms a KalshiEvent + one of its nested KalshiMarket
-// legs into the canonical models.Market struct used by every downstream
-// component.
-//
-// Title strategy:
-//   - Always starts with event.Title (the clean human-readable question).
-//   - If the market leg carries a YesSubTitle (the strike-level qualifier,
-//     e.g. ">5.25%"), it is appended in parentheses so the heuristic matcher
-//     receives a full sentence: "Federal Reserve rate decision (>5.25%)".
-//   - Falls back to the raw ticker only when both title sources are empty.
-//
-// Category strategy:
-//   - Uses event.Category (lowercased) when the API returns one.
-//   - Falls back to ticker-prefix heuristics via categorizeByEventTicker.
-//
-// Error checkpoints:
-//   - empty ticker → "market ticker is empty"
-//   - unparseable close_time → "failed to parse close_time"
-//   - prices outside [0, 1] → "invalid price range"
-func AdaptKalshiMarket(event KalshiEvent, raw KalshiMarket) (models.Market, error) {
+// AdaptKalshiMarket transforms one v1 search result plus one of its nested
+// market entries into the canonical models.Market struct used downstream.
+func AdaptKalshiMarket(series KalshiSeriesResult, raw KalshiMarket) (models.Market, error) {
 	if raw.Ticker == "" {
 		return models.Market{}, &equinoxerrors.EquinoxError{
 			Layer:   "normalizer",
@@ -46,63 +29,38 @@ func AdaptKalshiMarket(event KalshiEvent, raw KalshiMarket) (models.Market, erro
 		}
 	}
 
-	yesBid, err := parseDollarPrice(raw.YesBidDollars)
+	yesBid, err := parseSearchPrice(raw.YesBidDollars, raw.YesBid)
 	if err != nil {
 		return models.Market{}, &equinoxerrors.EquinoxError{
 			Layer:   "normalizer",
 			Venue:   "kalshi",
-			Message: fmt.Sprintf("invalid yes_bid_dollars: %s", raw.YesBidDollars),
+			Message: fmt.Sprintf("invalid yes_bid price for %s", raw.Ticker),
 			Err:     err,
 		}
 	}
 
-	yesAsk, err := parseDollarPrice(raw.YesAskDollars)
+	yesAsk, err := parseSearchPrice(raw.YesAskDollars, raw.YesAsk)
 	if err != nil {
 		return models.Market{}, &equinoxerrors.EquinoxError{
 			Layer:   "normalizer",
 			Venue:   "kalshi",
-			Message: fmt.Sprintf("invalid yes_ask_dollars: %s", raw.YesAskDollars),
+			Message: fmt.Sprintf("invalid yes_ask price for %s", raw.Ticker),
 			Err:     err,
 		}
 	}
 
-	resolvesAt, err := time.Parse(time.RFC3339, raw.CloseTime)
+	resolvesAt, err := parseCloseTime(raw)
 	if err != nil {
-		return models.Market{}, &equinoxerrors.EquinoxError{
-			Layer:   "normalizer",
-			Venue:   "kalshi",
-			Message: fmt.Sprintf("failed to parse close_time: %s", raw.CloseTime),
-			Err:     err,
-		}
+		return models.Market{}, err
 	}
 
+	title := buildCanonicalTitle(series, raw)
 	mid := (yesBid + yesAsk) / 2
-
-	liquidity := 0.0
-	if raw.OpenInterestFp != "" {
-		if liq, parseErr := strconv.ParseFloat(raw.OpenInterestFp, 64); parseErr == nil {
-			liquidity = liq
-		}
-	}
-
-	// Build title: event title + optional strike subtitle in parens.
-	title := event.Title
-	if raw.YesSubTitle != "" {
-		title = fmt.Sprintf("%s (%s)", event.Title, raw.YesSubTitle)
-	}
-	if title == "" {
-		title = raw.Ticker
-	}
-
-	// Use the event's category when available; fall back to ticker heuristics.
-	category := strings.ToLower(event.Category)
+	liquidity := deriveLiquidity(series, raw)
+	category := strings.ToLower(series.Category)
 	if category == "" {
-		category = categorizeByEventTicker(raw.EventTicker)
+		category = categorizeSearchResult(series)
 	}
-
-	resolutionDate := resolvesAt.UTC().Format("2006-01-02")
-	underlying := extractKalshiUnderlying(event, raw)
-	strikePrice := parseKalshiStrikePrice(raw.YesSubTitle)
 
 	return models.Market{
 		ID:             generateID(raw.Ticker),
@@ -115,21 +73,85 @@ func AdaptKalshiMarket(event KalshiEvent, raw KalshiMarket) (models.Market, erro
 		NoPrice:        1.0 - mid,
 		Spread:         yesAsk - yesBid,
 		Liquidity:      liquidity,
-		Volume24h:      float64(raw.Volume24h),
+		Volume24h:      float64(raw.Volume),
 		ResolvesAt:     resolvesAt,
-		ResolutionDate: resolutionDate,
+		ResolutionDate: resolvesAt.UTC().Format("2006-01-02"),
 		FetchedAt:      time.Now(),
-		Underlying:     underlying,
-		StrikePrice:    strikePrice,
+		Underlying:     extractKalshiUnderlying(series, raw),
+		StrikePrice:    parseKalshiStrikePrice(raw),
 		Category:       category,
 		Status:         mapKalshiStatus(raw.Status),
-		RawData:        raw,
+		RawData: RawSearchMarket{
+			Series: series,
+			Market: raw,
+		},
 	}, nil
 }
 
-// parseDollarPrice converts a Kalshi fixed-point dollar string (e.g. "0.5600")
-// to a float64 in [0, 1]. An empty string is treated as 0.0 (valid, no error).
-// A value outside [0, 1] is an error.
+func parseSearchPrice(dollarValue string, centValue int) (float64, error) {
+	if dollarValue != "" {
+		return parseDollarPrice(dollarValue)
+	}
+	if centValue < 0 || centValue > 100 {
+		return 0, fmt.Errorf("cent price %d outside valid range", centValue)
+	}
+	return float64(centValue) / 100.0, nil
+}
+
+func parseCloseTime(raw KalshiMarket) (time.Time, error) {
+	closeTS := raw.CloseTS
+	if closeTS == "" {
+		closeTS = raw.ExpectedExpirationTS
+	}
+	if closeTS == "" {
+		return time.Time{}, &equinoxerrors.EquinoxError{
+			Layer:   "normalizer",
+			Venue:   "kalshi",
+			Message: "market close timestamp is empty",
+		}
+	}
+
+	resolvesAt, err := time.Parse(time.RFC3339, closeTS)
+	if err != nil {
+		return time.Time{}, &equinoxerrors.EquinoxError{
+			Layer:   "normalizer",
+			Venue:   "kalshi",
+			Message: fmt.Sprintf("failed to parse close_ts: %s", closeTS),
+			Err:     err,
+		}
+	}
+	return resolvesAt, nil
+}
+
+func buildCanonicalTitle(series KalshiSeriesResult, raw KalshiMarket) string {
+	switch {
+	case series.EventTitle != "" && raw.YesSubtitle != "":
+		return fmt.Sprintf("%s (%s)", series.EventTitle, raw.YesSubtitle)
+	case series.EventTitle != "":
+		return series.EventTitle
+	case series.SeriesTitle != "" && raw.YesSubtitle != "":
+		return fmt.Sprintf("%s (%s)", series.SeriesTitle, raw.YesSubtitle)
+	case series.SeriesTitle != "":
+		return series.SeriesTitle
+	case raw.YesSubtitle != "":
+		return raw.YesSubtitle
+	default:
+		return raw.Ticker
+	}
+}
+
+func deriveLiquidity(series KalshiSeriesResult, raw KalshiMarket) float64 {
+	if raw.Volume > 0 {
+		return float64(raw.Volume)
+	}
+	if series.TotalVolume > 0 {
+		return float64(series.TotalVolume)
+	}
+	return 0
+}
+
+// parseDollarPrice converts a fixed-point dollar string (e.g. "0.5600")
+// to a float64 in [0, 1]. An empty string is treated as 0.0.
 func parseDollarPrice(s string) (float64, error) {
 	if s == "" {
 		return 0.0, nil
@@ -145,19 +167,13 @@ func parseDollarPrice(s string) (float64, error) {
 }
 
 // mapKalshiStatus converts a Kalshi market lifecycle status into the canonical
-// statuses used by the routing engine.
-//
-// Kalshi lifecycle: initialized → inactive → active → closed →
-// determined → disputed / amended → finalized.
-//
-// Only "active" maps to "open" — it is the sole state where the market is
-// accepting orders. "initialized" and "inactive" are pre-trading states that
-// map to "pending".
+// statuses used by the routing engine. v1 search results are open markets, so
+// an empty status defaults to "open".
 func mapKalshiStatus(status string) string {
-	switch status {
-	case "active":
+	switch strings.ToLower(status) {
+	case "", "active", "open":
 		return "open"
-	case "initialized", "inactive":
+	case "initialized", "inactive", "pending":
 		return "pending"
 	default:
 		return "closed"
@@ -165,56 +181,77 @@ func mapKalshiStatus(status string) string {
 }
 
 // extractKalshiUnderlying returns a normalized asset symbol (e.g. "SOL", "BTC")
-// from the event ticker or title for same-underlying equivalence pre-filtering.
-func extractKalshiUnderlying(event KalshiEvent, raw KalshiMarket) string {
-	upper := strings.ToUpper(event.EventTicker + " " + event.SeriesTicker + " " + event.Title)
+// from the series metadata for same-underlying equivalence pre-filtering.
+func extractKalshiUnderlying(series KalshiSeriesResult, raw KalshiMarket) string {
+	parts := []string{
+		series.SeriesTicker,
+		series.EventTicker,
+		series.SeriesTitle,
+		series.EventTitle,
+		strings.Join(series.Tags, " "),
+		strings.Join(series.TopicKeywords, " "),
+		raw.YesSubtitle,
+	}
+	upper := strings.ToUpper(strings.Join(parts, " "))
 	switch {
-	case strings.Contains(upper, "KXSOLE") || strings.Contains(upper, "SOLANA") || (strings.Contains(upper, "SOL ") && strings.Contains(upper, "PRICE")):
+	case strings.Contains(upper, "KXSOLE") || strings.Contains(upper, "SOLANA") || (strings.Contains(upper, "SOL") && strings.Contains(upper, "PRICE")):
 		return "SOL"
-	case strings.Contains(upper, "KXBTCD") || strings.Contains(upper, "BITCOIN") || strings.Contains(upper, "BTC"):
+	case strings.Contains(upper, "KXBTCD") || strings.Contains(upper, "BITCOIN") || strings.Contains(upper, " BTC"):
 		return "BTC"
-	case strings.Contains(upper, "ETH"):
+	case strings.Contains(upper, "ETHEREUM") || strings.Contains(upper, " ETH"):
 		return "ETH"
 	default:
 		return ""
 	}
 }
 
-// parseKalshiStrikePrice extracts a numeric threshold from YesSubTitle for
-// price markets, e.g. "89 or above" -> 89, "81 to 819999" -> 81. Returns 0
-// when no parseable threshold is found.
-func parseKalshiStrikePrice(yesSubTitle string) float64 {
-	if yesSubTitle == "" {
+func parseKalshiStrikePrice(raw KalshiMarket) float64 {
+	candidates := []string{raw.YesSubtitle}
+	for _, v := range raw.CustomStrike {
+		candidates = append(candidates, v)
+	}
+	text := strings.Join(candidates, " ")
+	if text == "" {
 		return 0
 	}
-	// Match "N or above" or "N or higher", or first number in "N to M" range.
-	orAbove := regexp.MustCompile(`(?i)(\d+(?:\.\d+)?)\s*(?:or\s+)?(?:above|higher)`)
-	if m := orAbove.FindStringSubmatch(yesSubTitle); len(m) >= 2 {
-		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+
+	orAbove := regexp.MustCompile(`(?i)(\d[\d,]*(?:\.\d+)?)\s*(?:or\s+)?(?:above|higher)`)
+	if m := orAbove.FindStringSubmatch(text); len(m) >= 2 {
+		if v, err := parseNumericToken(m[1]); err == nil {
 			return v
 		}
 	}
-	rangeRe := regexp.MustCompile(`(\d+(?:\.\d+)?)\s*to\s*\d+`)
-	if m := rangeRe.FindStringSubmatch(yesSubTitle); len(m) >= 2 {
-		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+
+	rangeRe := regexp.MustCompile(`(\d[\d,]*(?:\.\d+)?)\s*to\s*\d`)
+	if m := rangeRe.FindStringSubmatch(text); len(m) >= 2 {
+		if v, err := parseNumericToken(m[1]); err == nil {
 			return v
 		}
 	}
-	// Single number as fallback.
-	numRe := regexp.MustCompile(`(\d+(?:\.\d+)?)`)
-	if m := numRe.FindStringSubmatch(yesSubTitle); len(m) >= 2 {
-		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+
+	numRe := regexp.MustCompile(`(\d[\d,]*(?:\.\d+)?)`)
+	if m := numRe.FindStringSubmatch(text); len(m) >= 2 {
+		if v, err := parseNumericToken(m[1]); err == nil {
 			return v
 		}
 	}
+
 	return 0
 }
 
-// categorizeByEventTicker derives a category string from the Kalshi event
-// ticker prefix. Kalshi does not expose a category field directly; the ticker
-// prefix is the best public signal available.
-func categorizeByEventTicker(eventTicker string) string {
-	upper := strings.ToUpper(eventTicker)
+func parseNumericToken(s string) (float64, error) {
+	return strconv.ParseFloat(strings.ReplaceAll(s, ",", ""), 64)
+}
+
+func categorizeSearchResult(series KalshiSeriesResult) string {
+	upper := strings.ToUpper(strings.Join([]string{
+		series.SeriesTicker,
+		series.EventTicker,
+		series.SeriesTitle,
+		series.EventTitle,
+		strings.Join(series.Tags, " "),
+		strings.Join(series.TopicKeywords, " "),
+	}, " "))
 	switch {
 	case strings.Contains(upper, "BTC") ||
 		strings.Contains(upper, "ETH") ||

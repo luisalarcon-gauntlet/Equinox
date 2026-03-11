@@ -16,16 +16,15 @@ import (
 	"github.com/equinox/models"
 )
 
-// anthropicResp is a minimal Anthropic messages API response.
-type anthropicResp struct {
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
+type openAIResp struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
 }
 
-// mockAnthropicServer starts a test HTTP server that returns canned responses.
-func mockAnthropicServer(t *testing.T, statusCode int, body string) *httptest.Server {
+func mockOpenAIServer(t *testing.T, statusCode int, body string) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -34,27 +33,29 @@ func mockAnthropicServer(t *testing.T, statusCode int, body string) *httptest.Se
 	}))
 }
 
-// validAnthropicBody builds a minimal valid Anthropic response with the given JSON text.
-func validAnthropicBody(text string) string {
-	resp := anthropicResp{}
-	resp.Content = []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}{{Type: "text", Text: text}}
+func validOpenAIBody(text string) string {
+	resp := openAIResp{}
+	resp.Choices = []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	}{{Message: struct {
+		Content string `json:"content"`
+	}{Content: text}}}
 	b, _ := json.Marshal(resp)
 	return string(b)
 }
 
-func testClient(t *testing.T, serverURL string) *ai.AnthropicClient {
+func testClient(t *testing.T, serverURL string) *ai.OpenAIClient {
 	t.Helper()
 	cfg := &config.Config{
-		AnthropicAPIKey: "test-key",
-		HTTPTimeout:     5 * time.Second,
+		OpenAIAPIKey: "test-key",
+		HTTPTimeout:  5 * time.Second,
 	}
-	log := logger.New(io.Discard) // discard logs in tests
-	client, err := ai.NewAnthropicClient(cfg, log, serverURL)
+	log := logger.New(io.Discard)
+	client, err := ai.NewOpenAIClient(cfg, log, serverURL)
 	if err != nil {
-		t.Fatalf("NewAnthropicClient() error = %v", err)
+		t.Fatalf("NewOpenAIClient() error = %v", err)
 	}
 	return client
 }
@@ -64,30 +65,30 @@ func testMarkets() (models.Market, models.Market) {
 	marketA := models.Market{
 		ID:         "a",
 		Venue:      "kalshi",
-		Title:      "will gop control the house after 2026 midterms",
+		Title:      "will democrats control the house after 2026 midterms",
 		ResolvesAt: future,
 		FetchedAt:  time.Now(),
 	}
 	marketB := models.Market{
 		ID:         "b",
 		Venue:      "polymarket",
-		Title:      "democrats win house majority 2026",
+		Title:      "will democrats win house majority 2026",
 		ResolvesAt: future,
 		FetchedAt:  time.Now(),
 	}
 	return marketA, marketB
 }
 
-func TestAnthropicClientReturnsEquivalenceResult(t *testing.T) {
-	jsonResp := `{"is_equivalent":true,"are_opposites":true,"confidence":0.93,"reasoning":"These are opposite sides of the 2026 House control question."}`
-	srv := mockAnthropicServer(t, http.StatusOK, validAnthropicBody(jsonResp))
+func TestOpenAIClientReturnsEquivalenceResult(t *testing.T) {
+	jsonResp := `{"is_match":true,"confidence":0.93,"reasoning":"same election question"}`
+	srv := mockOpenAIServer(t, http.StatusOK, validOpenAIBody(jsonResp))
 	defer srv.Close()
 
 	client := testClient(t, srv.URL)
 	marketA, marketB := testMarkets()
 
 	toolResults := []tools.ToolResult{
-		{ToolName: "check_opposites", Result: true, Confidence: 0.90, Reasoning: "party opposites detected"},
+		{ToolName: "check_entity_match", Result: true, Confidence: 0.90, Reasoning: "entity overlap"},
 		{ToolName: "check_date_alignment", Result: true, Confidence: 1.0, Reasoning: "same date"},
 	}
 
@@ -95,11 +96,8 @@ func TestAnthropicClientReturnsEquivalenceResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EvaluateEquivalence() error = %v", err)
 	}
-	if !result.IsEquivalent {
-		t.Errorf("IsEquivalent = false, want true")
-	}
-	if !result.AreOpposites {
-		t.Errorf("AreOpposites = false, want true")
+	if !result.IsMatch {
+		t.Errorf("IsMatch = false, want true")
 	}
 	if result.Confidence < 0.90 {
 		t.Errorf("Confidence = %v, want >= 0.90", result.Confidence)
@@ -112,8 +110,8 @@ func TestAnthropicClientReturnsEquivalenceResult(t *testing.T) {
 	}
 }
 
-func TestAnthropicClientHandlesNon200(t *testing.T) {
-	srv := mockAnthropicServer(t, http.StatusInternalServerError, `{"error":"internal server error"}`)
+func TestOpenAIClientHandlesNon200(t *testing.T) {
+	srv := mockOpenAIServer(t, http.StatusInternalServerError, `{"error":{"message":"internal server error"}}`)
 	defer srv.Close()
 
 	client := testClient(t, srv.URL)
@@ -125,9 +123,8 @@ func TestAnthropicClientHandlesNon200(t *testing.T) {
 	}
 }
 
-func TestAnthropicClientHandlesMalformedJSON(t *testing.T) {
-	// The Anthropic response is valid HTTP 200 but the text content is not valid JSON.
-	srv := mockAnthropicServer(t, http.StatusOK, validAnthropicBody("not-valid-json"))
+func TestOpenAIClientHandlesMalformedJSON(t *testing.T) {
+	srv := mockOpenAIServer(t, http.StatusOK, validOpenAIBody("not-valid-json"))
 	defer srv.Close()
 
 	client := testClient(t, srv.URL)
@@ -139,10 +136,7 @@ func TestAnthropicClientHandlesMalformedJSON(t *testing.T) {
 	}
 }
 
-func TestAnthropicClientHandlesTimeout(t *testing.T) {
-	// Server that blocks briefly — longer than the context deadline.
-	// We use a channel to unblock the handler when the test is done so
-	// srv.Close() does not hang waiting for the goroutine to exit.
+func TestOpenAIClientHandlesTimeout(t *testing.T) {
 	unblock := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
@@ -157,11 +151,11 @@ func TestAnthropicClientHandlesTimeout(t *testing.T) {
 	}()
 
 	cfg := &config.Config{
-		AnthropicAPIKey: "test-key",
-		HTTPTimeout:     5 * time.Second,
+		OpenAIAPIKey: "test-key",
+		HTTPTimeout:  5 * time.Second,
 	}
 	log := logger.New(io.Discard)
-	client, _ := ai.NewAnthropicClient(cfg, log, srv.URL)
+	client, _ := ai.NewOpenAIClient(cfg, log, srv.URL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -173,21 +167,20 @@ func TestAnthropicClientHandlesTimeout(t *testing.T) {
 	}
 }
 
-func TestAnthropicClientRejectsEmptyAPIKey(t *testing.T) {
+func TestOpenAIClientRejectsEmptyAPIKey(t *testing.T) {
 	cfg := &config.Config{
-		AnthropicAPIKey: "",
-		HTTPTimeout:     5 * time.Second,
+		OpenAIAPIKey: "",
+		HTTPTimeout:  5 * time.Second,
 	}
 	log := logger.New(io.Discard)
-	_, err := ai.NewAnthropicClient(cfg, log, "http://localhost")
+	_, err := ai.NewOpenAIClient(cfg, log, "http://localhost")
 	if err == nil {
-		t.Errorf("NewAnthropicClient() error = nil, want error for empty API key")
+		t.Errorf("NewOpenAIClient() error = nil, want error for empty API key")
 	}
 }
 
-func TestAnthropicClientGracefulFallback(t *testing.T) {
-	// Server that returns empty content array — malformed but no panic expected.
-	srv := mockAnthropicServer(t, http.StatusOK, `{"content":[]}`)
+func TestOpenAIClientGracefulFallback(t *testing.T) {
+	srv := mockOpenAIServer(t, http.StatusOK, `{"choices":[]}`)
 	defer srv.Close()
 
 	client := testClient(t, srv.URL)
@@ -195,6 +188,133 @@ func TestAnthropicClientGracefulFallback(t *testing.T) {
 
 	_, err := client.EvaluateEquivalence(context.Background(), marketA, marketB, nil)
 	if err == nil {
-		t.Errorf("EvaluateEquivalence() error = nil, want error for empty content array")
+		t.Errorf("EvaluateEquivalence() error = nil, want error for empty choices array")
+	}
+}
+
+// ── EvaluateBatch ─────────────────────────────────────────────────────────────
+
+func TestOpenAIClientBatchEvaluateReturnsTwoResults(t *testing.T) {
+	// Model returns a 2-element array in order.
+	batchResp := `[{"pair":0,"is_match":true,"confidence":0.93,"reasoning":"same event"},` +
+		`{"pair":1,"is_match":false,"confidence":0.12,"reasoning":"different event"}]`
+	srv := mockOpenAIServer(t, http.StatusOK, validOpenAIBody(batchResp))
+	defer srv.Close()
+
+	client := testClient(t, srv.URL)
+	marketA, marketB := testMarkets()
+
+	pairs := []ai.BatchPair{
+		{MarketA: marketA, MarketB: marketB},
+		{MarketA: marketB, MarketB: marketA},
+	}
+
+	results, err := client.EvaluateBatch(context.Background(), pairs)
+	if err != nil {
+		t.Fatalf("EvaluateBatch() error = %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	if !results[0].IsMatch {
+		t.Errorf("pair 0: IsMatch = false, want true")
+	}
+	if results[1].IsMatch {
+		t.Errorf("pair 1: IsMatch = true, want false")
+	}
+	if !results[0].UsedAILayer {
+		t.Errorf("pair 0: UsedAILayer = false, want true")
+	}
+}
+
+func TestOpenAIClientBatchEvaluateHandlesOutOfOrderResponse(t *testing.T) {
+	// Model returns items in reverse order; parseBatchResults must re-index by pair field.
+	batchResp := `[{"pair":1,"is_match":false,"confidence":0.10,"reasoning":"b"},` +
+		`{"pair":0,"is_match":true,"confidence":0.95,"reasoning":"a"}]`
+	srv := mockOpenAIServer(t, http.StatusOK, validOpenAIBody(batchResp))
+	defer srv.Close()
+
+	client := testClient(t, srv.URL)
+	marketA, marketB := testMarkets()
+
+	pairs := []ai.BatchPair{
+		{MarketA: marketA, MarketB: marketB},
+		{MarketA: marketB, MarketB: marketA},
+	}
+
+	results, err := client.EvaluateBatch(context.Background(), pairs)
+	if err != nil {
+		t.Fatalf("EvaluateBatch() error = %v", err)
+	}
+	if !results[0].IsMatch {
+		t.Errorf("pair 0: IsMatch = false, want true (re-indexed from pair field)")
+	}
+	if results[1].IsMatch {
+		t.Errorf("pair 1: IsMatch = true, want false (re-indexed from pair field)")
+	}
+}
+
+func TestOpenAIClientBatchLengthMismatchReturnsError(t *testing.T) {
+	// Response has 1 item but we sent 2 pairs → must error so caller can fall back.
+	batchResp := `[{"pair":0,"is_match":true,"confidence":0.93,"reasoning":"x"}]`
+	srv := mockOpenAIServer(t, http.StatusOK, validOpenAIBody(batchResp))
+	defer srv.Close()
+
+	client := testClient(t, srv.URL)
+	marketA, marketB := testMarkets()
+
+	pairs := []ai.BatchPair{
+		{MarketA: marketA, MarketB: marketB},
+		{MarketA: marketB, MarketB: marketA},
+	}
+
+	_, err := client.EvaluateBatch(context.Background(), pairs)
+	if err == nil {
+		t.Errorf("EvaluateBatch() error = nil, want error for length mismatch")
+	}
+}
+
+func TestOpenAIClientBatchOutOfRangeIndexReturnsError(t *testing.T) {
+	// Model returns a pair index that is out of range.
+	batchResp := `[{"pair":99,"is_match":true,"confidence":0.90,"reasoning":"x"}]`
+	srv := mockOpenAIServer(t, http.StatusOK, validOpenAIBody(batchResp))
+	defer srv.Close()
+
+	client := testClient(t, srv.URL)
+	marketA, marketB := testMarkets()
+
+	pairs := []ai.BatchPair{{MarketA: marketA, MarketB: marketB}}
+
+	_, err := client.EvaluateBatch(context.Background(), pairs)
+	if err == nil {
+		t.Errorf("EvaluateBatch() error = nil, want error for out-of-range pair index")
+	}
+}
+
+func TestOpenAIClientBatchHandlesMalformedJSON(t *testing.T) {
+	srv := mockOpenAIServer(t, http.StatusOK, validOpenAIBody("not-valid-json"))
+	defer srv.Close()
+
+	client := testClient(t, srv.URL)
+	marketA, marketB := testMarkets()
+
+	pairs := []ai.BatchPair{{MarketA: marketA, MarketB: marketB}}
+
+	_, err := client.EvaluateBatch(context.Background(), pairs)
+	if err == nil {
+		t.Errorf("EvaluateBatch() error = nil, want error for malformed JSON")
+	}
+}
+
+func TestOpenAIClientBatchEmptyInputReturnsNil(t *testing.T) {
+	// No HTTP call should be made for an empty input slice.
+	client := testClient(t, "http://localhost:0") // unreachable — must not be contacted
+
+	results, err := client.EvaluateBatch(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("EvaluateBatch() error = %v, want nil for empty input", err)
+	}
+	if results != nil {
+		t.Errorf("EvaluateBatch() results = %v, want nil for empty input", results)
 	}
 }

@@ -18,52 +18,60 @@ import (
 )
 
 const (
-	defaultAnthropicBaseURL = "https://api.anthropic.com"
-	anthropicModel          = "claude-sonnet-4-20250514"
-	anthropicVersion        = "2023-06-01"
-	maxTokens               = 1024
+	defaultOpenAIBaseURL = "https://api.openai.com/v1"
+	openAIModel          = "gpt-4.1-nano"
+	maxTokensSingle      = 120 // sufficient for one {"is_match":…,"confidence":…,"reasoning":…}
+	maxTokensBatch       = 400 // sufficient for up to 5 pair results with reasoning
 )
 
-// EquivalenceResult holds the structured output from Claude's synthesis.
+// EquivalenceResult holds the structured output from the AI classifier.
 type EquivalenceResult struct {
-	IsEquivalent bool    `json:"is_equivalent"`
-	AreOpposites bool    `json:"are_opposites"`
-	Confidence   float64 `json:"confidence"`
-	Reasoning    string  `json:"reasoning"`
-	// UsedAILayer is always true when this struct is returned from AnthropicClient.
+	IsMatch    bool    `json:"is_match"`
+	Confidence float64 `json:"confidence"`
+	Reasoning  string  `json:"reasoning"`
+	// UsedAILayer is always true when this struct is returned from OpenAIClient.
 	UsedAILayer bool
 }
 
-// AnthropicClient sends market pairs to Claude for equivalence synthesis.
-// It only receives pre-computed tool results — it never calls Kalshi or Polymarket.
-type AnthropicClient struct {
+// BatchPair is one market pair with pre-computed tool signals,
+// ready to be included in a multi-pair AI request.
+type BatchPair struct {
+	MarketA     models.Market
+	MarketB     models.Market
+	ToolResults []tools.ToolResult
+}
+
+// OpenAIClient sends compact market-pair classification requests to OpenAI.
+// It only receives pre-computed local tool results — it never calls venue APIs.
+type OpenAIClient struct {
 	apiKey     string
 	baseURL    string
 	httpClient *http.Client
 	log        *logger.Logger
 }
 
-// NewAnthropicClient constructs an AnthropicClient.
-// baseURL is the Anthropic API root (overridable in tests via a mock server URL).
-// Returns an EquinoxError if the API key is empty.
-func NewAnthropicClient(cfg *config.Config, log *logger.Logger, baseURL string) (*AnthropicClient, error) {
-	if cfg.AnthropicAPIKey == "" {
+// NewOpenAIClient constructs an OpenAI-backed equivalence classifier.
+func NewOpenAIClient(cfg *config.Config, log *logger.Logger, baseURL string) (*OpenAIClient, error) {
+	if cfg.OpenAIAPIKey == "" {
 		return nil, &equinoxerrors.EquinoxError{
 			Layer:   "ai",
-			Venue:   "anthropic",
-			Message: "ANTHROPIC_API_KEY environment variable not set",
+			Venue:   "openai",
+			Message: "OPENAI_API_KEY environment variable not set",
 		}
 	}
 	if baseURL == "" {
-		baseURL = defaultAnthropicBaseURL
+		baseURL = cfg.OpenAIBaseURL
+	}
+	if baseURL == "" {
+		baseURL = defaultOpenAIBaseURL
 	}
 	timeout := cfg.HTTPTimeout
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
-	return &AnthropicClient{
-		apiKey:  cfg.AnthropicAPIKey,
-		baseURL: baseURL,
+	return &OpenAIClient{
+		apiKey:  cfg.OpenAIAPIKey,
+		baseURL: strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
@@ -71,75 +79,98 @@ func NewAnthropicClient(cfg *config.Config, log *logger.Logger, baseURL string) 
 	}, nil
 }
 
-// EvaluateEquivalence sends both market titles and all tool results to Claude,
-// then parses the JSON response into an EquivalenceResult.
-//
-// Prompt design: all tool evidence is included as structured text so Claude
-// synthesises existing signals rather than reasoning from scratch. This makes
-// AI decisions auditable and cost-efficient.
-func (c *AnthropicClient) EvaluateEquivalence(
+// EvaluateEquivalence sends a single market pair and its tool signals to OpenAI,
+// then parses the JSON classifier response into an EquivalenceResult.
+// Used by Detector.Detect for single-pair evaluation.
+func (c *OpenAIClient) EvaluateEquivalence(
 	ctx context.Context,
 	marketA models.Market,
 	marketB models.Market,
 	toolResults []tools.ToolResult,
 ) (EquivalenceResult, error) {
-	c.log.Info("ai", "anthropic", fmt.Sprintf(
-		"evaluating equivalence: '%s' vs '%s'",
-		marketA.Title, marketB.Title,
-	))
+	const systemPrompt = "You classify whether two prediction markets refer to the same real-world outcome. " +
+		"Return JSON only with keys is_match, confidence, reasoning."
 
 	prompt := buildEquivalencePrompt(marketA, marketB, toolResults)
-	text, err := c.complete(ctx, prompt)
+	text, err := c.complete(ctx, systemPrompt, prompt, maxTokensSingle)
 	if err != nil {
-		c.log.Error("ai", "anthropic", "equivalence evaluation failed", err)
+		c.log.Error("ai", "openai", "equivalence evaluation failed", err)
 		return EquivalenceResult{}, err
 	}
 
-	parsed, err := parseEquivalenceResult(text)
+	parsed, err := parseSingleResult(text)
 	if err != nil {
-		c.log.Error("ai", "anthropic", "failed to parse response", err)
+		c.log.Error("ai", "openai", "failed to parse response", err)
 		return EquivalenceResult{}, err
 	}
-
-	c.log.Info("ai", "anthropic", fmt.Sprintf(
-		"equivalence result: equivalent=%v opposites=%v confidence=%.2f",
-		parsed.IsEquivalent, parsed.AreOpposites, parsed.Confidence,
-	))
 
 	return parsed, nil
 }
 
-// ---- Anthropic API types ----
+// EvaluateBatch sends up to 5 market pairs in a single OpenAI request and
+// returns one EquivalenceResult per pair in the same order.
+// The response is validated: if the model returns a different number of results
+// than pairs sent, an error is returned so the caller can fall back gracefully.
+func (c *OpenAIClient) EvaluateBatch(ctx context.Context, pairs []BatchPair) ([]EquivalenceResult, error) {
+	if len(pairs) == 0 {
+		return nil, nil
+	}
 
-type anthropicRequest struct {
-	Model     string             `json:"model"`
-	MaxTokens int                `json:"max_tokens"`
-	Messages  []anthropicMessage `json:"messages"`
+	const systemPrompt = "You classify prediction market pairs. " +
+		"Return a JSON array with exactly one object per pair in order. " +
+		`Each object must have: "pair" (integer index), "is_match" (boolean), ` +
+		`"confidence" (0.0-1.0), "reasoning" (brief string). ` +
+		"Return the JSON array only — no other text."
+
+	prompt := buildBatchPrompt(pairs)
+	text, err := c.complete(ctx, systemPrompt, prompt, maxTokensBatch)
+	if err != nil {
+		c.log.Error("ai", "openai", "batch evaluation failed", err)
+		return nil, err
+	}
+
+	results, err := parseBatchResults(text, len(pairs))
+	if err != nil {
+		c.log.Error("ai", "openai", "failed to parse batch response", err)
+		return nil, err
+	}
+
+	return results, nil
 }
 
-type anthropicMessage struct {
+// ── HTTP transport ────────────────────────────────────────────────────────────
+
+type openAIChatCompletionRequest struct {
+	Model       string                      `json:"model"`
+	MaxTokens   int                         `json:"max_tokens"`
+	Temperature float64                     `json:"temperature"`
+	Messages    []openAIChatCompletionEntry `json:"messages"`
+}
+
+type openAIChatCompletionEntry struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
 }
 
-type anthropicResponse struct {
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
+type openAIChatCompletionResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error,omitempty"`
 }
 
-// complete sends a single user message to the Anthropic messages API and
-// returns the raw text of the first content block.
-func (c *AnthropicClient) complete(ctx context.Context, prompt string) (string, error) {
-	reqBody := anthropicRequest{
-		Model:     anthropicModel,
-		MaxTokens: maxTokens,
-		Messages: []anthropicMessage{
-			{Role: "user", Content: prompt},
+func (c *OpenAIClient) complete(ctx context.Context, systemPrompt, userPrompt string, maxTok int) (string, error) {
+	reqBody := openAIChatCompletionRequest{
+		Model:       openAIModel,
+		MaxTokens:   maxTok,
+		Temperature: 0,
+		Messages: []openAIChatCompletionEntry{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
 		},
 	}
 
@@ -147,31 +178,29 @@ func (c *AnthropicClient) complete(ctx context.Context, prompt string) (string, 
 	if err != nil {
 		return "", &equinoxerrors.EquinoxError{
 			Layer:   "ai",
-			Venue:   "anthropic",
+			Venue:   "openai",
 			Message: "failed to marshal request body",
 			Err:     err,
 		}
 	}
 
-	url := c.baseURL + "/v1/messages"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return "", &equinoxerrors.EquinoxError{
 			Layer:   "ai",
-			Venue:   "anthropic",
+			Venue:   "openai",
 			Message: "failed to create HTTP request",
 			Err:     err,
 		}
 	}
-	req.Header.Set("x-api-key", c.apiKey)
-	req.Header.Set("anthropic-version", anthropicVersion)
-	req.Header.Set("content-type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return "", &equinoxerrors.EquinoxError{
 			Layer:   "ai",
-			Venue:   "anthropic",
+			Venue:   "openai",
 			Message: "HTTP request failed",
 			Err:     err,
 		}
@@ -182,7 +211,7 @@ func (c *AnthropicClient) complete(ctx context.Context, prompt string) (string, 
 	if err != nil {
 		return "", &equinoxerrors.EquinoxError{
 			Layer:   "ai",
-			Venue:   "anthropic",
+			Venue:   "openai",
 			Message: "failed to read response body",
 			Err:     err,
 		}
@@ -191,71 +220,87 @@ func (c *AnthropicClient) complete(ctx context.Context, prompt string) (string, 
 	if resp.StatusCode != http.StatusOK {
 		return "", &equinoxerrors.EquinoxError{
 			Layer:   "ai",
-			Venue:   "anthropic",
+			Venue:   "openai",
 			Message: fmt.Sprintf("unexpected HTTP status %d: %s", resp.StatusCode, string(rawBody)),
 		}
 	}
 
-	var apiResp anthropicResponse
+	var apiResp openAIChatCompletionResponse
 	if err := json.Unmarshal(rawBody, &apiResp); err != nil {
 		return "", &equinoxerrors.EquinoxError{
 			Layer:   "ai",
-			Venue:   "anthropic",
+			Venue:   "openai",
 			Message: "failed to unmarshal API response",
 			Err:     err,
 		}
 	}
 
-	if len(apiResp.Content) == 0 {
+	if len(apiResp.Choices) == 0 {
 		return "", &equinoxerrors.EquinoxError{
 			Layer:   "ai",
-			Venue:   "anthropic",
-			Message: "API response contained no content blocks",
+			Venue:   "openai",
+			Message: "API response contained no choices",
 		}
 	}
 
-	for _, block := range apiResp.Content {
-		if block.Type == "text" {
-			return block.Text, nil
+	content := strings.TrimSpace(apiResp.Choices[0].Message.Content)
+	if content == "" {
+		return "", &equinoxerrors.EquinoxError{
+			Layer:   "ai",
+			Venue:   "openai",
+			Message: "API response contained empty message content",
 		}
 	}
-
-	return "", &equinoxerrors.EquinoxError{
-		Layer:   "ai",
-		Venue:   "anthropic",
-		Message: "API response contained no text content blocks",
-	}
+	return content, nil
 }
 
-// buildEquivalencePrompt constructs the synthesis prompt from market context
-// and pre-computed tool results. All tool evidence is passed as structured text
-// so Claude can reference explicit signals rather than free-associating.
+// ── Prompt builders ───────────────────────────────────────────────────────────
+
+// buildEquivalencePrompt produces the single-pair classification prompt.
 func buildEquivalencePrompt(a, b models.Market, toolResults []tools.ToolResult) string {
-	return fmt.Sprintf(`You are an equivalence detection agent for prediction markets.
+	return fmt.Sprintf(
+		`Decide if these two prediction markets resolve to the same real-world outcome.
 
-Market A: "%s" (venue: %s, resolves: %s)
-Market B: "%s" (venue: %s, resolves: %s)
-
-Tool Results:
+Market A: title=%q venue=%s resolves=%s
+Market B: title=%q venue=%s resolves=%s
+Signals:
 %s
 
-Based on these tool results, determine if Market A and Market B refer to the same
-real-world event or outcome. Consider that they may be:
-1. Identical questions worded differently
-2. Opposite sides of the same event (one YES = other NO)
-3. Completely unrelated
-
-Respond in JSON only — no markdown, no explanation outside the JSON:
-{
-  "is_equivalent": true/false,
-  "are_opposites": true/false,
-  "confidence": 0.0-1.0,
-  "reasoning": "brief explanation"
-}`,
+Return JSON only:
+{"is_match":true|false,"confidence":0.0-1.0,"reasoning":"short explanation"}`,
 		a.Title, a.Venue, formatDate(a.ResolvesAt),
 		b.Title, b.Venue, formatDate(b.ResolvesAt),
 		formatToolResults(toolResults),
 	)
+}
+
+// buildBatchPrompt produces the multi-pair classification prompt.
+// Each pair is numbered [0]…[N-1]; the model must return a JSON array
+// with exactly N objects in the same order.
+func buildBatchPrompt(pairs []BatchPair) string {
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Classify these %d prediction market pairs:\n\n", len(pairs))
+
+	for i, p := range pairs {
+		fmt.Fprintf(&sb, "[%d]\n", i)
+		fmt.Fprintf(&sb, "A: title=%q venue=%s resolves=%s\n",
+			p.MarketA.Title, p.MarketA.Venue, formatDate(p.MarketA.ResolvesAt))
+		fmt.Fprintf(&sb, "B: title=%q venue=%s resolves=%s\n",
+			p.MarketB.Title, p.MarketB.Venue, formatDate(p.MarketB.ResolvesAt))
+		if len(p.ToolResults) > 0 {
+			sb.WriteString("Signals:\n")
+			sb.WriteString(formatToolResults(p.ToolResults))
+			sb.WriteString("\n")
+		}
+		sb.WriteString("\n")
+	}
+
+	fmt.Fprintf(&sb,
+		"Return a JSON array of exactly %d objects in order.\n"+
+			`Each: {"pair":<index>,"is_match":true|false,"confidence":0.0-1.0,"reasoning":"brief"}`,
+		len(pairs),
+	)
+	return sb.String()
 }
 
 func formatDate(t time.Time) string {
@@ -267,21 +312,20 @@ func formatDate(t time.Time) string {
 
 func formatToolResults(results []tools.ToolResult) string {
 	if len(results) == 0 {
-		return "  (no tool results available)"
+		return "- none"
 	}
 	var sb strings.Builder
 	for _, r := range results {
-		sb.WriteString(fmt.Sprintf("  - %s: result=%v confidence=%.2f — %s\n",
-			r.ToolName, r.Result, r.Confidence, r.Reasoning))
+		sb.WriteString(fmt.Sprintf("- %s result=%t confidence=%.2f\n",
+			r.ToolName, r.Result, r.Confidence))
 	}
-	return sb.String()
+	return strings.TrimRight(sb.String(), "\n")
 }
 
-// parseEquivalenceResult extracts and parses the JSON equivalence result from
-// Claude's response text. Claude may wrap the JSON in markdown code fences;
-// we strip those before unmarshalling.
-func parseEquivalenceResult(text string) (EquivalenceResult, error) {
-	// Strip optional markdown code fence (```json ... ``` or ``` ... ```).
+// ── Response parsers ──────────────────────────────────────────────────────────
+
+// parseSingleResult extracts an EquivalenceResult from the model's plain-JSON reply.
+func parseSingleResult(text string) (EquivalenceResult, error) {
 	cleaned := strings.TrimSpace(text)
 	if idx := strings.Index(cleaned, "{"); idx > 0 {
 		cleaned = cleaned[idx:]
@@ -294,7 +338,7 @@ func parseEquivalenceResult(text string) (EquivalenceResult, error) {
 	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
 		return EquivalenceResult{}, &equinoxerrors.EquinoxError{
 			Layer:   "ai",
-			Venue:   "anthropic",
+			Venue:   "openai",
 			Message: fmt.Sprintf("failed to parse equivalence JSON from response: %q", text),
 			Err:     err,
 		}
@@ -302,4 +346,64 @@ func parseEquivalenceResult(text string) (EquivalenceResult, error) {
 
 	result.UsedAILayer = true
 	return result, nil
+}
+
+// batchItem is the per-pair structure expected in the model's array response.
+type batchItem struct {
+	Pair       int     `json:"pair"`
+	IsMatch    bool    `json:"is_match"`
+	Confidence float64 `json:"confidence"`
+	Reasoning  string  `json:"reasoning"`
+}
+
+// parseBatchResults decodes the model's JSON array response and validates that
+// it contains exactly expectedLen items with in-range pair indices.
+// Items may be returned out of order; they are re-indexed by their pair field.
+func parseBatchResults(text string, expectedLen int) ([]EquivalenceResult, error) {
+	cleaned := strings.TrimSpace(text)
+
+	// Strip any leading text before the opening bracket (e.g. markdown fences).
+	if idx := strings.Index(cleaned, "["); idx > 0 {
+		cleaned = cleaned[idx:]
+	}
+	if idx := strings.LastIndex(cleaned, "]"); idx >= 0 && idx < len(cleaned)-1 {
+		cleaned = cleaned[:idx+1]
+	}
+
+	var items []batchItem
+	if err := json.Unmarshal([]byte(cleaned), &items); err != nil {
+		return nil, &equinoxerrors.EquinoxError{
+			Layer:   "ai",
+			Venue:   "openai",
+			Message: fmt.Sprintf("failed to parse batch JSON from response: %q", text),
+			Err:     err,
+		}
+	}
+
+	if len(items) != expectedLen {
+		return nil, &equinoxerrors.EquinoxError{
+			Layer:   "ai",
+			Venue:   "openai",
+			Message: fmt.Sprintf("batch response has %d items, expected %d", len(items), expectedLen),
+		}
+	}
+
+	results := make([]EquivalenceResult, expectedLen)
+	for _, item := range items {
+		if item.Pair < 0 || item.Pair >= expectedLen {
+			return nil, &equinoxerrors.EquinoxError{
+				Layer:   "ai",
+				Venue:   "openai",
+				Message: fmt.Sprintf("batch response contains out-of-range pair index %d (valid range 0-%d)", item.Pair, expectedLen-1),
+			}
+		}
+		results[item.Pair] = EquivalenceResult{
+			IsMatch:     item.IsMatch,
+			Confidence:  item.Confidence,
+			Reasoning:   item.Reasoning,
+			UsedAILayer: true,
+		}
+	}
+
+	return results, nil
 }

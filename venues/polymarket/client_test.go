@@ -6,10 +6,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/equinox/logger"
+	"github.com/equinox/venues"
 )
 
 func newPolyTestClient(t *testing.T, handler http.Handler) *PolymarketClient {
@@ -158,5 +160,39 @@ func TestFetchMarkets_InactiveEventSkipped(t *testing.T) {
 	}
 	if len(markets) != 0 {
 		t.Errorf("inactive events should be skipped, got %d markets", len(markets))
+	}
+}
+
+func TestFetchMarkets_LimitsToTopTenMarkets(t *testing.T) {
+	future := time.Now().Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	markets := make([]Market, 0, 12)
+	for i := 1; i <= 12; i++ {
+		markets = append(markets, Market{
+			ID:            "market-" + strconv.Itoa(i),
+			Question:      "Will test outcome " + strconv.Itoa(i) + " happen in 2027?",
+			Active:        true,
+			EndDate:       future,
+			OutcomePrices: `["0.50","0.50"]`,
+		})
+	}
+
+	events := []Event{
+		{
+			Title:   "Test Event",
+			Active:  true,
+			Markets: markets,
+		},
+	}
+
+	client := newPolyTestClient(t, serveSearchResponse(t, events))
+	got, err := client.FetchMarkets(context.Background(), "test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != venues.MaxMarketsPerVenue {
+		t.Fatalf("got %d markets, want %d", len(got), venues.MaxMarketsPerVenue)
+	}
+	if got[len(got)-1].VenueID != "market-10" {
+		t.Fatalf("last returned market = %q, want %q", got[len(got)-1].VenueID, "market-10")
 	}
 }

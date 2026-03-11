@@ -151,7 +151,7 @@ AI decision transparent — every tool call is logged with its result.
 - "Will X happen?" vs "Will X fail to happen?"
   → Logical negation
 
-**Returns:** are_opposites (bool), confidence (float64), reasoning (string)
+**Returns:** confidence (float64), reasoning (string)
 
 ### Tool 2: check_synonyms
 **Purpose:** Detect equivalent terminology used differently across venues.
@@ -193,19 +193,18 @@ matches that indicate same-type questions about the same timeframe.
 
 **Returns:** structurally_equivalent (bool), confidence (float64)
 
-### Claude Synthesis
-After tools run, their results are passed to Claude with this context:
+### OpenAI Nano Classification
+After tools run, their results are passed to OpenAI `gpt-4.1-nano` with this context:
 - Both market titles
 - Both resolution dates
 - All tool results with their confidence scores and reasoning
 
-Claude returns:
+OpenAI returns:
 ```json
 {
-  "is_equivalent": true,
-  "are_opposites": false,
+  "is_match": true,
   "confidence": 0.91,
-  "reasoning": "Both markets ask about Democratic House control in 2026. check_synonyms confirmed 'Democrats' and 'House majority' match across both titles. check_date_alignment confirmed same resolution window."
+  "reasoning": "Both markets ask about Democratic House control in 2026."
 }
 ```
 
@@ -228,21 +227,17 @@ Claude returns:
 - 0.558 < 0.80 → escalate to AI layer
 
 **AI Tool Layer:**
-- check_opposites → TRUE (0.94) "GOP control = Democrats not winning = same race"
 - check_synonyms → found: GOP ↔ Republicans, but no direct Dem synonym hit
 - check_entity_match → after synonym resolution: {house, 2026} overlap improved
 - check_date_alignment → TRUE (0.90) both resolve Nov 2026
 - check_structural_equivalence → TRUE (0.85) both "will X control Y?"
 
-**Claude Synthesis:**
-- is_equivalent: TRUE
-- are_opposites: TRUE
+**OpenAI Classification:**
+- is_match: TRUE
 - confidence: 0.93
-- reasoning: "These are opposite sides of the 2026 House control question.
-  check_opposites confirmed GOP winning = Democrats losing on the same race.
-  Resolution dates align. High confidence these are complementary markets."
+- reasoning: "These titles refer to the same 2026 House control market."
 
-**Result:** MatchResult{IsMatch: true, AreOpposites: true, Confidence: 0.93, Method: "heuristic+ai"}
+**Result:** MatchResult{IsMatch: true, Confidence: 0.93, Method: "heuristic+ai"}
 
 ---
 

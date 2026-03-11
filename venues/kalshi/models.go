@@ -1,105 +1,139 @@
 package kalshi
 
-// KalshiMarket mirrors the market object returned by the Kalshi Trade API v2
-// GET /markets endpoint. Fields are tagged to match the snake_case JSON keys.
-//
-// Pricing note: the `_dollars` fields are the authoritative price source —
-// they are fixed-point decimal strings in [0, 1] representing the dollar
-// value of a Yes contract (which pays $1 at settlement). The legacy integer
-// `yes_bid`/`yes_ask` fields (in cents) are deprecated by Kalshi and ignored.
-//
-// Liquidity note: `liquidity` and `liquidity_dollars` are deprecated by Kalshi
-// and always return 0. We use `open_interest` (contract count) as a liquidity
-// proxy for routing comparisons.
+// SearchParams controls the GET /v1/search/series request.
+// Query is required by the upstream API; the remaining fields are optional.
+type SearchParams struct {
+	Query    string
+	PageSize int
+	Page     int
+	Cursor   string
+	OrderBy  string
+	Category string
+	Status   string
+}
+
+// KalshiMarket mirrors one nested market entry returned by GET /v1/search/series.
+// Prices are exposed both as cents and as fixed-point dollar strings.
 type KalshiMarket struct {
-	Ticker      string `json:"ticker"`       // e.g. "KXBTCD-25DEC31-B100000"
-	EventTicker string `json:"event_ticker"` // e.g. "KXBTCD-25DEC31"
+	Ticker string `json:"ticker"`
 
-	// Titles — `title` is deprecated by Kalshi; prefer `yes_sub_title`.
-	Title      string `json:"title"`
-	YesSubTitle string `json:"yes_sub_title"` // shortened question for the Yes side
-	NoSubTitle  string `json:"no_sub_title"`
+	YesSubtitle string `json:"yes_subtitle"`
+	NoSubtitle  string `json:"no_subtitle"`
 
-	MarketType string `json:"market_type"` // "binary" or "scalar"
+	YesBid    int `json:"yes_bid"`
+	YesAsk    int `json:"yes_ask"`
+	LastPrice int `json:"last_price"`
 
-	// Status lifecycle: initialized → inactive → active → closed →
-	// determined → disputed / amended → finalized
-	Status string `json:"status"`
-
-	// Prices as fixed-point dollar strings, e.g. "0.5600".
-	// Range is [0, 1] (a Kalshi contract pays $1 on resolution).
-	YesBidDollars string `json:"yes_bid_dollars"`
-	YesAskDollars string `json:"yes_ask_dollars"`
-	NoBidDollars  string `json:"no_bid_dollars"`
-	NoAskDollars  string `json:"no_ask_dollars"`
-
+	YesBidDollars    string `json:"yes_bid_dollars"`
+	YesAskDollars    string `json:"yes_ask_dollars"`
 	LastPriceDollars string `json:"last_price_dollars"`
 
-	// Volume in contract units (integer counts).
-	Volume    int `json:"volume"`
-	Volume24h int `json:"volume_24h"`
+	PriceDelta    int `json:"price_delta"`
+	PreviousPrice int `json:"previous_price"`
 
-	// OpenInterest is the number of outstanding contracts.
-	// Used as a liquidity proxy since the `liquidity` field is deprecated.
-	OpenInterest   int    `json:"open_interest"`
-	OpenInterestFp string `json:"open_interest_fp"` // same value, fixed-point string
+	Volume int64 `json:"volume"`
+	Score  int   `json:"score"`
 
-	// Timestamps in RFC3339 format.
-	CloseTime   string `json:"close_time"`
-	OpenTime    string `json:"open_time"`
-	CreatedTime string `json:"created_time"`
+	CloseTS              string `json:"close_ts"`
+	ExpectedExpirationTS string `json:"expected_expiration_ts"`
+	OpenTS               string `json:"open_ts"`
 
-	// SettlementTs is set after the market settles (nullable in the API).
-	// A non-empty value is a definitive signal that the market is finished.
-	SettlementTs string `json:"settlement_ts"`
-
-	// Rules text (used for audit / display only, not for routing logic).
-	RulesPrimary   string `json:"rules_primary"`
-	RulesSecondary string `json:"rules_secondary"`
-
-	// Result is set after determination: "yes", "no", "scalar", or "".
+	// Some v1 responses include status; when omitted we infer "open" from the endpoint.
+	Status string `json:"status"`
 	Result string `json:"result"`
+
+	CustomStrike         map[string]string `json:"custom_strike"`
+	RulebookVariables    map[string]string `json:"rulebook_variables"`
+	ImageURLDarkMode     string            `json:"image_url_dark_mode"`
+	ImageURLLightMode    string            `json:"image_url_light_mode"`
+	BackgroundColorDark  string            `json:"background_color_dark_mode"`
+	BackgroundColorLight string            `json:"background_color_light_mode"`
+	ImageScale           int               `json:"image_scale"`
+	PreviousPriceDollars string            `json:"previous_price_dollars"`
 }
 
-// KalshiMarketsResponse is the top-level envelope returned by GET /markets.
-// Retained for reference; active fetching now uses KalshiEventsResponse.
-type KalshiMarketsResponse struct {
+// ProductMetadata carries editorial classification from Kalshi.
+type ProductMetadata struct {
+	Categories          []string            `json:"categories"`
+	Subcategories       map[string][]string `json:"subcategories"`
+	Scope               *string             `json:"scope"`
+	PromotedMilestoneID string              `json:"promoted_milestone_id"`
+}
+
+// KalshiSeriesResult is one ranked series entry returned by GET /v1/search/series.
+// Each result includes event context and nested active markets.
+type KalshiSeriesResult struct {
+	SeriesTicker  string `json:"series_ticker"`
+	SeriesTitle   string `json:"series_title"`
+	EventTicker   string `json:"event_ticker"`
+	EventTitle    string `json:"event_title"`
+	EventSubtitle string `json:"event_subtitle"`
+	Category      string `json:"category"`
+
+	TotalSeriesVolume int64 `json:"total_series_volume"`
+	TotalVolume       int64 `json:"total_volume"`
+
+	TotalMarketCount  int `json:"total_market_count"`
+	ActiveMarketCount int `json:"active_market_count"`
+	SearchScore       int `json:"search_score"`
+
+	IsTrending   bool `json:"is_trending"`
+	IsNew        bool `json:"is_new"`
+	IsClosing    bool `json:"is_closing"`
+	IsPriceDelta bool `json:"is_price_delta"`
+
+	FeeType       string  `json:"fee_type"`
+	FeeMultiplier float64 `json:"fee_multiplier"`
+
+	Tags            []string        `json:"tags"`
+	TopicKeywords   []string        `json:"topic_keywords"`
+	MilestoneID     string          `json:"milestone_id"`
+	ProductMetadata ProductMetadata `json:"product_metadata"`
+
 	Markets []KalshiMarket `json:"markets"`
-	Cursor  string         `json:"cursor"` // opaque pagination token
 }
 
-// KalshiEvent mirrors the event object returned by GET /events with
-// with_nested_markets=true. An event groups one or more related market legs
-// (e.g. different strike prices) under a single human-readable title.
-// This is the authoritative source for the canonical question text — the
-// per-market `title` field is deprecated by Kalshi and often cryptic.
-type KalshiEvent struct {
-	EventTicker  string         `json:"event_ticker"`  // e.g. "KXFEDRATE-25MAY"
-	SeriesTicker string         `json:"series_ticker"` // parent series, e.g. "KXFEDRATE" (the "Drawer")
-	Title        string         `json:"title"`         // full human-readable question
-	Category     string         `json:"category"`      // e.g. "Economics", "Politics"
-	Markets      []KalshiMarket `json:"markets"`       // nested market legs for this event
+// SearchResponse is the top-level GET /v1/search/series envelope.
+type SearchResponse struct {
+	TotalResultsCount int                  `json:"total_results_count"`
+	NextCursor        string               `json:"next_cursor"`
+	CurrentPage       []KalshiSeriesResult `json:"current_page"`
 }
 
-// KalshiEventsResponse is the top-level envelope returned by GET /events.
-type KalshiEventsResponse struct {
-	Events []KalshiEvent `json:"events"`
-	Cursor string        `json:"cursor"` // opaque pagination token
+// SeriesDetail mirrors GET /v1/series/ detail responses.
+type SeriesDetail struct {
+	Ticker        string  `json:"ticker"`
+	Title         string  `json:"title"`
+	Category      string  `json:"category"`
+	Frequency     string  `json:"frequency"`
+	FeeType       string  `json:"fee_type"`
+	FeeMultiplier float64 `json:"fee_multiplier"`
+	SeriesVolume  int64   `json:"series_volume"`
+
+	ContractTicker string `json:"contract_ticker"`
+	ContractURL    string `json:"contract_url"`
+
+	Keywords []string `json:"keywords"`
+	Tags     []string `json:"tags"`
+
+	ProductMetadata SeriesDetailProductMetadata `json:"product_metadata"`
 }
 
-// KalshiSeries mirrors the series object returned by GET /series.
-// A series is the top-level grouping on Kalshi (the "Drawer") that contains
-// one or more related Events. The Tags field is Kalshi's own discoverability
-// metadata — it is the primary signal used by the series relevance scorer.
-type KalshiSeries struct {
-	Ticker    string   `json:"ticker"`    // e.g. "KXBTCD"
-	Title     string   `json:"title"`     // e.g. "Bitcoin Daily Close"
-	Category  string   `json:"category"`  // e.g. "crypto", "economics"
-	Tags      []string `json:"tags"`      // Kalshi-curated subject tags, e.g. ["bitcoin","btc"]
-	Frequency string   `json:"frequency"` // e.g. "daily", "weekly", "one-off"
+type SeriesDetailProductMetadata struct {
+	About             string              `json:"about"`
+	Scope             string              `json:"scope"`
+	Subcategories     map[string][]string `json:"subcategories"`
+	SuggesterNickname string              `json:"suggester_nickname"`
 }
 
-// KalshiSeriesResponse is the top-level envelope returned by GET /series.
-type KalshiSeriesResponse struct {
-	Series []KalshiSeries `json:"series"`
+// SeriesResponse is the top-level GET /v1/series/ envelope.
+type SeriesResponse struct {
+	Series []SeriesDetail `json:"series"`
+}
+
+// RawSearchMarket preserves the original v1 series result and nested market
+// payload for audit/debug use inside the canonical model's RawData field.
+type RawSearchMarket struct {
+	Series KalshiSeriesResult `json:"series"`
+	Market KalshiMarket       `json:"market"`
 }

@@ -12,33 +12,34 @@ import (
 	"github.com/equinox/models"
 )
 
-// Tier thresholds for the three-tier pre-filter.
+// Tier thresholds for the two-tier pre-filter.
 // Scores below tierRejectCeiling are definitively unrelated — no AI call.
-// Scores above tierAcceptFloor are definitively the same market — no AI call.
-// Everything in between is genuinely ambiguous and goes to AI.
+// Everything at or above tierRejectCeiling goes to the AI layer.
 const (
 	tierRejectCeiling = 0.25
-	tierAcceptFloor   = 0.70
-	aiConcurrency     = 5 // max simultaneous AI calls (semaphore slots)
+	aiBatchSize       = 5  // pairs sent per AI API call
+	aiConcurrency     = 5  // max simultaneous AI calls for single-pair Detect
 )
 
 // AIEvaluator is the interface the Detector uses to call the AI layer.
-// Defining the interface here (rather than importing ai.AnthropicClient directly)
+// Defining the interface here (rather than importing ai.OpenAIClient directly)
 // allows tests to inject a mock without importing the live AI package.
 type AIEvaluator interface {
+	// EvaluateEquivalence classifies a single pair (used by Detect).
 	EvaluateEquivalence(ctx context.Context, marketA, marketB models.Market, toolResults []tools.ToolResult) (aipackage.EquivalenceResult, error)
+	// EvaluateBatch classifies up to aiBatchSize pairs in one API call (used by DetectAllPairs).
+	EvaluateBatch(ctx context.Context, pairs []aipackage.BatchPair) ([]aipackage.EquivalenceResult, error)
 }
 
 // Detector orchestrates the hybrid equivalence detection pipeline.
 //
-// Three-tier evaluation (AI is the tiebreaker, never the workhorse):
+// Two-tier evaluation:
 //
 //	Tier 1 — score < 0.25 : definite reject  → method="heuristic_reject", no AI call
-//	Tier 2 — 0.25–0.70    : ambiguous zone   → run tools + AI, method="heuristic+ai"
-//	Tier 3 — score > 0.70 : definite accept  → method="heuristic_accept", no AI call
+//	Tier 2 — score ≥ 0.25 : ambiguous zone   → run tools + AI, method="heuristic+ai"
 //
-// Simultaneous AI calls are throttled by a semaphore (aiConcurrency slots).
-// Pairs in tiers 1 and 3 never touch the semaphore, so they never block.
+// Single-pair path (Detect): AI calls are throttled by a semaphore (aiConcurrency slots).
+// Bulk path (DetectAllPairs): pairs are batched aiBatchSize at a time; each batch is one API call.
 //
 // Layer separation: Detector never touches venue APIs or routing logic.
 type Detector struct {
@@ -46,17 +47,16 @@ type Detector struct {
 	aiClient  AIEvaluator
 	allTools  []tools.Tool
 	threshold float64
-	sem       chan struct{} // throttles simultaneous AI calls — not a hard cap
+	sem       chan struct{} // throttles simultaneous AI calls in single-pair Detect
 	log       *logger.Logger
 }
 
-// NewDetector constructs a Detector with all five equivalence tools pre-registered.
+// NewDetector constructs a Detector with all equivalence tools pre-registered.
 func NewDetector(threshold float64, aiClient AIEvaluator, log *logger.Logger) *Detector {
 	return &Detector{
 		heuristic: NewHeuristicMatcher(threshold),
 		aiClient:  aiClient,
 		allTools: []tools.Tool{
-			tools.NewCheckOpposites(),
 			tools.NewCheckSynonyms(),
 			tools.NewCheckEntityMatch(),
 			tools.NewCheckDateAlignment(),
@@ -68,62 +68,153 @@ func NewDetector(threshold float64, aiClient AIEvaluator, log *logger.Logger) *D
 	}
 }
 
-// Detect runs the three-tier equivalence pipeline for a single market pair.
+// Detect runs the two-tier equivalence pipeline for a single market pair.
 // It always returns a MatchResult — errors from the AI layer are absorbed and
 // surfaced as warnings inside the result (graceful degradation).
+// Use DetectAllPairs for bulk evaluation; it batches AI calls more efficiently.
 func (d *Detector) Detect(ctx context.Context, marketA, marketB models.Market) (models.MatchResult, error) {
 	hResult := d.heuristic.Match(marketA, marketB)
-	score := hResult.Confidence
 
-	tier, tierLabel := d.classifyTier(score)
-	d.log.Info("equivalence", "", fmt.Sprintf(
-		"pair scored %.2f → tier %d (%s)", score, tier, tierLabel,
-	))
-
-	switch tier {
-	case 1:
+	if hResult.Confidence < tierRejectCeiling {
 		return d.tierRejectResult(marketA, marketB, hResult), nil
-	case 3:
-		return d.tierAcceptResult(marketA, marketB, hResult), nil
 	}
 
-	// Tier 2: acquire a semaphore slot before calling AI.
-	// This queues concurrent goroutines rather than dropping them — total
-	// throughput is unlimited, but simultaneous API calls are capped at aiConcurrency.
+	// Acquire a semaphore slot before calling AI.
 	select {
 	case d.sem <- struct{}{}:
 	case <-ctx.Done():
-		d.log.Warn("equivalence", "anthropic", "context cancelled while waiting for AI slot — returning heuristic-only result")
+		d.log.Warn("equivalence", "openai", "context cancelled while waiting for AI slot — returning heuristic-only result")
 		return d.fallbackResult(hResult), nil
 	}
 	defer func() { <-d.sem }()
 
 	toolResults := d.runToolsConcurrently(ctx, marketA, marketB)
 
+	recordAIAttempt(ctx)
 	aiResult, err := d.aiClient.EvaluateEquivalence(ctx, marketA, marketB, toolResults)
 	if err != nil {
-		d.log.Warn("equivalence", "anthropic", "AI layer unavailable — returning heuristic-only result")
-		d.log.Error("equivalence", "anthropic", "EvaluateEquivalence failed", err)
+		d.log.Warn("equivalence", "openai", "AI layer unavailable — returning heuristic-only result")
+		d.log.Error("equivalence", "openai", "EvaluateEquivalence failed", err)
 		return d.fallbackResult(hResult), nil
 	}
 
 	return d.buildAIResult(marketA, marketB, hResult, aiResult), nil
 }
 
-// classifyTier maps a heuristic score to a tier number and a short label
-// used in log output and the per-pair debug line.
-func (d *Detector) classifyTier(score float64) (tier int, label string) {
-	switch {
-	case score < tierRejectCeiling:
-		return 1, "heuristic_reject"
-	case score > tierAcceptFloor:
-		return 3, "heuristic_accept"
-	default:
-		return 2, "ai_evaluation"
+// DetectAllPairs runs equivalence detection on a slice of pre-filtered candidate pairs.
+// The two-phase pipeline:
+//
+//  1. Heuristics run concurrently on all pairs.
+//  2. Tier-1 pairs (score < 0.25) are rejected immediately — no AI.
+//  3. Tools run concurrently on every surviving tier-2 pair.
+//  4. Tier-2 pairs are sent to the AI in batches of aiBatchSize (5).
+//     The last batch may be smaller (e.g. 23 pairs → four batches of 5 + one of 3).
+//     If a batch fails, all pairs in that batch fall back to heuristic-only results.
+//
+// Results are returned in the same order as the input pairs slice.
+func (d *Detector) DetectAllPairs(ctx context.Context, pairs []models.MarketPair) ([]models.MatchResult, error) {
+	if len(pairs) == 0 {
+		return nil, nil
 	}
+
+	// ── Phase 1: run heuristics concurrently ─────────────────────────────────
+	type heuristicItem struct {
+		idx    int
+		pair   models.MarketPair
+		result models.MatchResult
+	}
+
+	hCh := make(chan heuristicItem, len(pairs))
+	var wg sync.WaitGroup
+	for i, p := range pairs {
+		wg.Add(1)
+		go func(idx int, pr models.MarketPair) {
+			defer wg.Done()
+			hCh <- heuristicItem{idx: idx, pair: pr, result: d.heuristic.Match(pr.A, pr.B)}
+		}(i, p)
+	}
+	wg.Wait()
+	close(hCh)
+
+	// Allocate result slice indexed by original pair position.
+	finalResults := make([]models.MatchResult, len(pairs))
+	var tier2 []heuristicItem
+
+	for item := range hCh {
+		if item.result.Confidence < tierRejectCeiling {
+			finalResults[item.idx] = d.tierRejectResult(item.pair.A, item.pair.B, item.result)
+		} else {
+			tier2 = append(tier2, item)
+		}
+	}
+
+	if len(tier2) == 0 {
+		return finalResults, nil
+	}
+
+	// ── Phase 2: run tools concurrently on all tier-2 pairs ──────────────────
+	type readyItem struct {
+		idx         int
+		pair        models.MarketPair
+		hResult     models.MatchResult
+		toolResults []tools.ToolResult
+	}
+
+	toolCh := make(chan readyItem, len(tier2))
+	for _, item := range tier2 {
+		wg.Add(1)
+		go func(hi heuristicItem) {
+			defer wg.Done()
+			tr := d.runToolsConcurrently(ctx, hi.pair.A, hi.pair.B)
+			toolCh <- readyItem{idx: hi.idx, pair: hi.pair, hResult: hi.result, toolResults: tr}
+		}(item)
+	}
+	wg.Wait()
+	close(toolCh)
+
+	var readyForAI []readyItem
+	for item := range toolCh {
+		readyForAI = append(readyForAI, item)
+	}
+
+	// ── Phase 3: AI calls in batches of aiBatchSize ──────────────────────────
+	for i := 0; i < len(readyForAI); i += aiBatchSize {
+		end := i + aiBatchSize
+		if end > len(readyForAI) {
+			end = len(readyForAI) // last batch may be smaller than aiBatchSize
+		}
+		batch := readyForAI[i:end]
+
+		batchPairs := make([]aipackage.BatchPair, len(batch))
+		for j, item := range batch {
+			batchPairs[j] = aipackage.BatchPair{
+				MarketA:     item.pair.A,
+				MarketB:     item.pair.B,
+				ToolResults: item.toolResults,
+			}
+		}
+
+		recordAIAttempt(ctx) // one API call per batch
+		batchResults, err := d.aiClient.EvaluateBatch(ctx, batchPairs)
+		if err != nil {
+			d.log.Warn("equivalence", "openai",
+				fmt.Sprintf("batch AI call failed (%d pairs) — using heuristic fallback", len(batch)))
+			d.log.Error("equivalence", "openai", "EvaluateBatch failed", err)
+			for _, item := range batch {
+				finalResults[item.idx] = d.fallbackResult(item.hResult)
+			}
+			continue
+		}
+
+		for j, item := range batch {
+			finalResults[item.idx] = d.buildAIResult(item.pair.A, item.pair.B, item.hResult, batchResults[j])
+		}
+	}
+
+	return finalResults, nil
 }
 
-// tierRejectResult returns a definite-reject MatchResult for tier 1 pairs.
+// tierRejectResult returns a definite-reject MatchResult for tier-1 pairs.
 // Confidence 0.95 reflects strong heuristic certainty that these markets are unrelated.
 func (d *Detector) tierRejectResult(marketA, marketB models.Market, h models.MatchResult) models.MatchResult {
 	return models.MatchResult{
@@ -137,23 +228,9 @@ func (d *Detector) tierRejectResult(marketA, marketB models.Market, h models.Mat
 	}
 }
 
-// tierAcceptResult returns a definite-accept MatchResult for tier 3 pairs.
-// Confidence 0.90 reflects strong heuristic certainty that these markets are equivalent.
-func (d *Detector) tierAcceptResult(marketA, marketB models.Market, h models.MatchResult) models.MatchResult {
-	return models.MatchResult{
-		MarketA:    marketA,
-		MarketB:    marketB,
-		IsMatch:    true,
-		Confidence: 0.90,
-		Method:     "heuristic_accept",
-		Reasoning:  h.Reasoning,
-		MatchedAt:  time.Now(),
-	}
-}
-
 // runToolsConcurrently executes all registered tools in parallel and collects
 // their results. Tool errors are logged but do not fail the overall evaluation —
-// a failed tool simply produces no result for Claude to consider.
+// a failed tool simply produces no result for the AI to consider.
 func (d *Detector) runToolsConcurrently(ctx context.Context, marketA, marketB models.Market) []tools.ToolResult {
 	type indexed struct {
 		idx    int
@@ -224,24 +301,18 @@ func (d *Detector) buildAIResult(
 	hResult models.MatchResult,
 	aiResult aipackage.EquivalenceResult,
 ) models.MatchResult {
-	d.log.Info("equivalence", "", fmt.Sprintf(
-		"AI result: equivalent=%v opposites=%v confidence=%.2f",
-		aiResult.IsEquivalent, aiResult.AreOpposites, aiResult.Confidence,
-	))
-
 	reasoning := fmt.Sprintf(
 		"[heuristic] %s | [ai] %s",
 		hResult.Reasoning, aiResult.Reasoning,
 	)
 
 	return models.MatchResult{
-		MarketA:      marketA,
-		MarketB:      marketB,
-		IsMatch:      aiResult.IsEquivalent,
-		AreOpposites: aiResult.AreOpposites,
-		Confidence:   aiResult.Confidence,
-		Method:       "heuristic+ai",
-		Reasoning:    reasoning,
-		MatchedAt:    time.Now(),
+		MarketA:    marketA,
+		MarketB:    marketB,
+		IsMatch:    aiResult.IsMatch,
+		Confidence: aiResult.Confidence,
+		Method:     "heuristic+ai",
+		Reasoning:  reasoning,
+		MatchedAt:  time.Now(),
 	}
 }

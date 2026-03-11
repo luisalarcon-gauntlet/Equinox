@@ -6,6 +6,10 @@ import (
 	"github.com/equinox/models"
 )
 
+// MaxMarketsPerVenue is the maximum number of canonical markets each venue
+// client should return for a single search workflow.
+const MaxMarketsPerVenue = 10
+
 // VenueConnector is the interface every venue client must implement.
 // The routing engine and server work exclusively against this interface —
 // never against concrete Kalshi or Polymarket types. This keeps the

@@ -43,6 +43,20 @@ func (m *mockDetector) Detect(_ context.Context, a, b models.Market) (models.Mat
 	return r, m.err
 }
 
+func (m *mockDetector) DetectAllPairs(_ context.Context, pairs []models.MarketPair) ([]models.MatchResult, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	results := make([]models.MatchResult, len(pairs))
+	for i, p := range pairs {
+		r := m.result
+		r.MarketA = p.A
+		r.MarketB = p.B
+		results[i] = r
+	}
+	return results, nil
+}
+
 type mockRouter struct {
 	decision models.RoutingDecision
 	err      error
@@ -203,15 +217,18 @@ func TestSearchEndpointReturnsMatches(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 
-	var results []models.MatchResult
-	if err := json.NewDecoder(rec.Body).Decode(&results); err != nil {
+	var resp models.SearchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("response is not valid JSON: %v", err)
 	}
-	if len(results) != 1 {
-		t.Fatalf("expected 1 match, got %d", len(results))
+	if len(resp.Matches) != 1 {
+		t.Fatalf("expected 1 match, got %d", len(resp.Matches))
 	}
-	if !results[0].IsMatch {
+	if !resp.Matches[0].IsMatch {
 		t.Error("expected IsMatch=true")
+	}
+	if resp.NoMatchesAboveThreshold {
+		t.Error("expected NoMatchesAboveThreshold=false when matches exist")
 	}
 }
 
@@ -242,12 +259,12 @@ func TestSearchEndpointSkipsConflictingUnderlyingPairs(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	var results []models.MatchResult
-	if err := json.NewDecoder(rec.Body).Decode(&results); err != nil {
+	var resp models.SearchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("response is not valid JSON: %v", err)
 	}
-	if len(results) != 0 {
-		t.Errorf("expected 0 matches (conflicting underlying assets → candidatePair rejects), got %d", len(results))
+	if len(resp.Matches) != 0 {
+		t.Errorf("expected 0 matches (conflicting underlying assets → candidatePair rejects), got %d", len(resp.Matches))
 	}
 }
 
@@ -279,12 +296,12 @@ func TestSearchEndpointAllowsMissingDatePairs(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	var results []models.MatchResult
-	if err := json.NewDecoder(rec.Body).Decode(&results); err != nil {
+	var resp models.SearchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("response is not valid JSON: %v", err)
 	}
-	if len(results) != 1 {
-		t.Errorf("expected 1 match (missing date on one side must not block the pair), got %d", len(results))
+	if len(resp.Matches) != 1 {
+		t.Errorf("expected 1 match (missing date on one side must not block the pair), got %d", len(resp.Matches))
 	}
 }
 
@@ -315,23 +332,23 @@ func TestSearchEndpointAllowsNearDatePairs(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
 	}
-	var results []models.MatchResult
-	if err := json.NewDecoder(rec.Body).Decode(&results); err != nil {
+	var resp models.SearchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("response is not valid JSON: %v", err)
 	}
-	if len(results) != 1 {
-		t.Errorf("expected 1 match (dates within 30-day window must reach detector), got %d", len(results))
+	if len(resp.Matches) != 1 {
+		t.Errorf("expected 1 match (dates within 30-day window must reach detector), got %d", len(resp.Matches))
 	}
 }
 
-func TestSearchEndpointRecommendsBestEvenWhenBelowBenchmark(t *testing.T) {
+func TestSearchEndpointNoMatchReturnsNoMatchFlag(t *testing.T) {
 	kMarket := testMarket("kalshi", "k-id-1")
 	pMarket := testMarket("polymarket", "p-id-1")
 
 	kalshiConn := &mockConnector{name: "kalshi", markets: []models.Market{kMarket}}
 	polyConn := &mockConnector{name: "polymarket", markets: []models.Market{pMarket}}
 
-	// Detector says NOT above benchmark, but we still recommend this pair as best available.
+	// Detector says NOT above benchmark — expect no matches and suggestions.
 	detector := &mockDetector{
 		result: models.MatchResult{IsMatch: false, Confidence: 0.10, Method: "heuristic"},
 	}
@@ -352,33 +369,32 @@ func TestSearchEndpointRecommendsBestEvenWhenBelowBenchmark(t *testing.T) {
 		t.Fatalf("expected 200, got %d", rec.Code)
 	}
 
-	var results []models.MatchResult
-	if err := json.NewDecoder(rec.Body).Decode(&results); err != nil {
+	var resp models.SearchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("response is not valid JSON: %v", err)
 	}
-	// We recommend the best match we have even when below benchmark (so 1 result).
-	if len(results) != 1 {
-		t.Errorf("expected 1 (best available below benchmark), got %d", len(results))
+	if len(resp.Matches) != 0 {
+		t.Errorf("expected 0 matches below benchmark, got %d", len(resp.Matches))
 	}
-	if results[0].IsMatch {
-		t.Error("expected IsMatch=false for below-benchmark recommendation")
+	if !resp.NoMatchesAboveThreshold {
+		t.Error("expected NoMatchesAboveThreshold=true when no pair is a confident match")
 	}
-	if results[0].Confidence != 0.10 {
-		t.Errorf("expected Confidence 0.10, got %v", results[0].Confidence)
+	if resp.Message == "" {
+		t.Error("expected a non-empty message prompting the user to refine their query")
+	}
+	// Suggestions should carry the raw venue markets (up to 3 each).
+	if len(resp.Suggestions.Kalshi) == 0 {
+		t.Error("expected at least 1 kalshi suggestion")
+	}
+	if len(resp.Suggestions.Polymarket) == 0 {
+		t.Error("expected at least 1 polymarket suggestion")
 	}
 }
 
 func TestSearchEndpointFetchesBothVenues(t *testing.T) {
-	kalshiCalled := false
-	polyCalled := false
-
 	kalshiConn := &mockConnector{name: "kalshi", markets: nil}
 	polyConn := &mockConnector{name: "polymarket", markets: nil}
-	// Override FetchMarkets via the spy wrapper below.
-	_ = kalshiCalled
-	_ = polyCalled
 
-	// Simpler: use two connectors that each return one market with different venues.
 	kMarket := testMarket("kalshi", "k-spy")
 	pMarket := testMarket("polymarket", "p-spy")
 	kalshiConn.markets = []models.Market{kMarket}
@@ -410,7 +426,7 @@ func TestSearchEndpointFetchesBothVenues(t *testing.T) {
 }
 
 func TestSearchEndpointHandlesVenueError(t *testing.T) {
-	// Kalshi fails, polymarket succeeds — endpoint should still return 200 with empty results.
+	// Kalshi fails, polymarket succeeds — endpoint should still return 200 with no-match response.
 	kalshiConn := &mockConnector{name: "kalshi", err: &testError{"kalshi down"}}
 	polyConn := &mockConnector{name: "polymarket", markets: []models.Market{testMarket("polymarket", "p1")}}
 
@@ -430,13 +446,13 @@ func TestSearchEndpointHandlesVenueError(t *testing.T) {
 		t.Fatalf("expected 200 even when one venue errors, got %d", rec.Code)
 	}
 
-	var results []models.MatchResult
-	if err := json.NewDecoder(rec.Body).Decode(&results); err != nil {
+	var resp models.SearchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("response is not valid JSON: %v", err)
 	}
 }
 
-func TestSearchEndpointReturnsEmptyArrayNotNull(t *testing.T) {
+func TestSearchEndpointReturnsObjectNotNull(t *testing.T) {
 	srv := server.NewServer(testFS, nil, &mockDetector{}, &mockRouter{}, silentLogger())
 
 	req := httptest.NewRequest(http.MethodGet, "/search?q=empty", nil)
@@ -444,8 +460,8 @@ func TestSearchEndpointReturnsEmptyArrayNotNull(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 
 	body := strings.TrimSpace(rec.Body.String())
-	if !strings.HasPrefix(body, "[") {
-		t.Errorf("expected JSON array, got: %s", body)
+	if !strings.HasPrefix(body, "{") {
+		t.Errorf("expected JSON object, got: %s", body)
 	}
 }
 

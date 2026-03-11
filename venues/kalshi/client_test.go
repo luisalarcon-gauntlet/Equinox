@@ -2,16 +2,11 @@ package kalshi_test
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,54 +15,16 @@ import (
 
 	"github.com/equinox/config"
 	"github.com/equinox/logger"
+	"github.com/equinox/venues"
 	"github.com/equinox/venues/kalshi"
 )
 
-// generateTestKeyFile creates a temporary RSA private key PEM file for use in
-// tests. The file is removed automatically via t.Cleanup. Returns the key ID
-// (fixed "test-key-id") and the absolute path to the PEM file.
-func generateTestKeyFile(t *testing.T) (keyID, keyPath string) {
-	t.Helper()
-
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		t.Fatalf("generateTestKeyFile: rsa.GenerateKey: %v", err)
-	}
-
-	keyBytes, err := x509.MarshalPKCS8PrivateKey(privateKey)
-	if err != nil {
-		t.Fatalf("generateTestKeyFile: MarshalPKCS8PrivateKey: %v", err)
-	}
-
-	tmpFile, err := os.CreateTemp("", "equinox-test-kalshi-key-*.pem")
-	if err != nil {
-		t.Fatalf("generateTestKeyFile: CreateTemp: %v", err)
-	}
-	t.Cleanup(func() { os.Remove(tmpFile.Name()) })
-
-	if err := pem.Encode(tmpFile, &pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes}); err != nil {
-		t.Fatalf("generateTestKeyFile: pem.Encode: %v", err)
-	}
-	tmpFile.Close()
-
-	return "test-key-id", tmpFile.Name()
-}
-
-// newTestClient creates a KalshiClient wired to the provided mock server URL,
-// using a freshly generated RSA key so signing works without real credentials.
-//
-// Two test-only overrides are applied so tests run fast:
-//   - retryBaseDelay → 0  (429 retries are instant, no sleeping)
-//   - rateLimiter    → unlimited  (no token-bucket delay between requests)
 func newTestClient(t *testing.T, serverURL string) *kalshi.KalshiClient {
 	t.Helper()
 
-	keyID, keyPath := generateTestKeyFile(t)
 	cfg := &config.Config{
-		KalshiBaseURL:    serverURL,
-		KalshiAPIKeyID:   keyID,
-		KalshiAPIKeyPath: keyPath,
-		HTTPTimeout:      5 * time.Second,
+		KalshiBaseURL: serverURL,
+		HTTPTimeout:   5 * time.Second,
 	}
 	log := logger.New(io.Discard)
 	client, err := kalshi.NewKalshiClient(cfg, log)
@@ -79,49 +36,45 @@ func newTestClient(t *testing.T, serverURL string) *kalshi.KalshiClient {
 	return client
 }
 
-// oneEventResponse returns a KalshiEventsResponse containing a single event
-// with one nested market leg — used for happy-path client tests.
-func oneEventResponse() kalshi.KalshiEventsResponse {
-	return kalshi.KalshiEventsResponse{
-		Events: []kalshi.KalshiEvent{
+func oneSearchResponse() kalshi.SearchResponse {
+	return kalshi.SearchResponse{
+		CurrentPage: []kalshi.KalshiSeriesResult{
 			{
-				EventTicker: "KXTEST",
-				Title:       "Test Market Event",
-				Category:    "other",
+				SeriesTicker: "KXTEST",
+				SeriesTitle:  "Test Market Series",
+				EventTicker:  "KXTEST-26NOV01",
+				EventTitle:   "Test Market Event",
+				Category:     "other",
 				Markets: []kalshi.KalshiMarket{
 					{
-						Ticker:         "KXTEST-26NOV01-Y",
-						EventTicker:    "KXTEST",
-						YesSubTitle:    "Will the test market resolve Yes?",
-						YesBidDollars:  "0.44",
-						YesAskDollars:  "0.46",
-						CloseTime:      "2026-11-01T00:00:00Z",
-						Status:         "active",
-						OpenInterestFp: "5000.00",
-						Volume24h:      1200,
+						Ticker:            "KXTEST-26NOV01-T1",
+						YesSubtitle:       "Will the test market resolve Yes?",
+						YesBidDollars:     "0.44",
+						YesAskDollars:     "0.46",
+						CloseTS:           "2026-11-01T00:00:00Z",
+						Status:            "open",
+						Volume:            1200,
+						Score:             900,
+						CustomStrike:      map[string]string{"Price": "$44"},
+						RulebookVariables: map[string]string{"image_link": "https://example.com"},
 					},
 				},
 			},
 		},
-		Cursor: "",
 	}
 }
-
-// ---------------------------------------------------------------------------
-// TestKalshiFetchReturnsMarkets — happy path
-// ---------------------------------------------------------------------------
 
 func TestKalshiFetchReturnsMarkets(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(oneEventResponse()); err != nil {
+		if err := json.NewEncoder(w).Encode(oneSearchResponse()); err != nil {
 			t.Errorf("mock server encode error: %v", err)
 		}
 	}))
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	markets, err := client.FetchMarkets(context.Background(), "")
+	markets, err := client.FetchMarkets(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -133,8 +86,8 @@ func TestKalshiFetchReturnsMarkets(t *testing.T) {
 	if m.Venue != "kalshi" {
 		t.Errorf("Venue = %q, want %q", m.Venue, "kalshi")
 	}
-	if m.VenueID != "KXTEST-26NOV01-Y" {
-		t.Errorf("VenueID = %q, want %q", m.VenueID, "KXTEST-26NOV01-Y")
+	if m.VenueID != "KXTEST-26NOV01-T1" {
+		t.Errorf("VenueID = %q, want %q", m.VenueID, "KXTEST-26NOV01-T1")
 	}
 	if m.YesBid != 0.44 {
 		t.Errorf("YesBid = %v, want 0.44", m.YesBid)
@@ -146,14 +99,12 @@ func TestKalshiFetchSetsAcceptHeader(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		capturedHeader = r.Header.Get("Accept")
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(oneEventResponse()); err != nil {
-			t.Errorf("mock server encode error: %v", err)
-		}
+		_ = json.NewEncoder(w).Encode(oneSearchResponse())
 	}))
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	_, err := client.FetchMarkets(context.Background(), "")
+	_, err := client.FetchMarkets(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -163,33 +114,34 @@ func TestKalshiFetchSetsAcceptHeader(t *testing.T) {
 }
 
 func TestKalshiFetchWithQuerySendsURLParams(t *testing.T) {
-	var capturedURL string
+	var capturedQuery string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		capturedURL = r.URL.RawQuery
+		capturedQuery = r.URL.RawQuery
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(kalshi.KalshiEventsResponse{}); err != nil {
-			t.Errorf("mock server encode error: %v", err)
-		}
+		_ = json.NewEncoder(w).Encode(kalshi.SearchResponse{})
 	}))
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	// Query filtering is client-side; the URL must always carry limit/status/with_nested_markets.
 	_, err := client.FetchMarkets(context.Background(), "bitcoin")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if capturedURL == "" {
-		t.Error("expected query parameters in request URL, got empty")
+	if capturedQuery == "" {
+		t.Fatal("expected query parameters in request URL, got empty")
+	}
+	if want := "query=bitcoin"; !contains(capturedQuery, want) {
+		t.Errorf("request query = %q, want substring %q", capturedQuery, want)
+	}
+	if want := "order_by=querymatch"; !contains(capturedQuery, want) {
+		t.Errorf("request query = %q, want substring %q", capturedQuery, want)
+	}
+	if want := "status=open"; !contains(capturedQuery, want) {
+		t.Errorf("request query = %q, want substring %q", capturedQuery, want)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestKalshiFetchSetsAuthHeaders — every request must carry all three
-// Kalshi authentication headers with non-empty values.
-// ---------------------------------------------------------------------------
-
-func TestKalshiFetchSetsAuthHeaders(t *testing.T) {
+func TestKalshiFetchDoesNotSendLegacyAuthHeaders(t *testing.T) {
 	var (
 		accessKey       string
 		accessTimestamp string
@@ -201,36 +153,24 @@ func TestKalshiFetchSetsAuthHeaders(t *testing.T) {
 		accessTimestamp = r.Header.Get("KALSHI-ACCESS-TIMESTAMP")
 		accessSignature = r.Header.Get("KALSHI-ACCESS-SIGNATURE")
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(kalshi.KalshiEventsResponse{}); err != nil {
-			t.Errorf("mock server encode error: %v", err)
-		}
+		_ = json.NewEncoder(w).Encode(kalshi.SearchResponse{})
 	}))
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	_, err := client.FetchMarkets(context.Background(), "")
+	_, err := client.FetchMarkets(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if accessKey != "test-key-id" {
-		t.Errorf("KALSHI-ACCESS-KEY = %q, want %q", accessKey, "test-key-id")
-	}
-	if accessTimestamp == "" {
-		t.Error("KALSHI-ACCESS-TIMESTAMP is empty, want a millisecond timestamp")
-	}
-	if accessSignature == "" {
-		t.Error("KALSHI-ACCESS-SIGNATURE is empty, want a base64-encoded RSA-PSS signature")
+	if accessKey != "" || accessTimestamp != "" || accessSignature != "" {
+		t.Errorf("legacy auth headers should be absent, got key=%q timestamp=%q signature=%q",
+			accessKey, accessTimestamp, accessSignature)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestKalshiFetchHandlesTimeout — context deadline exceeded
-// ---------------------------------------------------------------------------
-
 func TestKalshiFetchHandlesTimeout(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Block until the client's context expires.
 		select {
 		case <-r.Context().Done():
 			return
@@ -245,15 +185,11 @@ func TestKalshiFetchHandlesTimeout(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
 
-	_, err := client.FetchMarkets(ctx, "")
+	_, err := client.FetchMarkets(ctx, "test")
 	if err == nil {
 		t.Fatal("expected timeout error, got nil")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// TestKalshiFetchHandlesNon200 — API returns error status
-// ---------------------------------------------------------------------------
 
 func TestKalshiFetchHandlesNon200(t *testing.T) {
 	tests := []struct {
@@ -273,17 +209,13 @@ func TestKalshiFetchHandlesNon200(t *testing.T) {
 			defer server.Close()
 
 			client := newTestClient(t, server.URL)
-			_, err := client.FetchMarkets(context.Background(), "")
+			_, err := client.FetchMarkets(context.Background(), "test")
 			if err == nil {
 				t.Fatalf("expected error for status %d, got nil", tt.status)
 			}
 		})
 	}
 }
-
-// ---------------------------------------------------------------------------
-// TestKalshiFetchHandlesMalformedJSON — response body is not valid JSON
-// ---------------------------------------------------------------------------
 
 func TestKalshiFetchHandlesMalformedJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -293,31 +225,21 @@ func TestKalshiFetchHandlesMalformedJSON(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	_, err := client.FetchMarkets(context.Background(), "")
+	_, err := client.FetchMarkets(context.Background(), "test")
 	if err == nil {
 		t.Fatal("expected JSON decode error, got nil")
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestKalshiFetchHandlesEmptyResponse — API returns zero markets
-// ---------------------------------------------------------------------------
-
 func TestKalshiFetchHandlesEmptyResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		empty := kalshi.KalshiEventsResponse{
-			Events: []kalshi.KalshiEvent{},
-			Cursor: "",
-		}
-		if err := json.NewEncoder(w).Encode(empty); err != nil {
-			t.Errorf("mock server encode error: %v", err)
-		}
+		_ = json.NewEncoder(w).Encode(kalshi.SearchResponse{CurrentPage: []kalshi.KalshiSeriesResult{}})
 	}))
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	markets, err := client.FetchMarkets(context.Background(), "")
+	markets, err := client.FetchMarkets(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -326,10 +248,6 @@ func TestKalshiFetchHandlesEmptyResponse(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestKalshiGetVenueName
-// ---------------------------------------------------------------------------
-
 func TestKalshiGetVenueName(t *testing.T) {
 	client := newTestClient(t, "http://localhost")
 	if got := client.GetVenueName(); got != "kalshi" {
@@ -337,85 +255,136 @@ func TestKalshiGetVenueName(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestKalshiFetchSkipsInvalidMarkets — adapter errors are collected, not fatal
-// ---------------------------------------------------------------------------
-
-func TestKalshiFetchSkipsInvalidMarkets(t *testing.T) {
+func TestKalshiFetchLimitsToTopTenMarkets(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		// One event with two legs: one valid, one with empty ticker (adapter error).
-		resp := kalshi.KalshiEventsResponse{
-			Events: []kalshi.KalshiEvent{
+		resp := kalshi.SearchResponse{
+			CurrentPage: []kalshi.KalshiSeriesResult{
 				{
-					EventTicker: "KXGOOD",
-					Title:       "Good Test Event",
-					Category:    "other",
-					Markets: []kalshi.KalshiMarket{
-						{
-							Ticker:        "KXGOOD-26NOV01-Y",
-							EventTicker:   "KXGOOD",
-							YesBidDollars: "0.50",
-							YesAskDollars: "0.52",
-							CloseTime:     "2026-11-01T00:00:00Z",
-							Status:        "active",
-							OpenInterest:  100,
-							Volume24h:     50,
-						},
-						{
-							// Invalid: empty ticker → adapter returns error, leg is skipped.
-							Ticker:        "",
-							YesBidDollars: "0.50",
-							YesAskDollars: "0.52",
-							CloseTime:     "2026-11-01T00:00:00Z",
-						},
-					},
+					SeriesTicker: "KXTEST",
+					SeriesTitle:  "Test Market Series",
+					EventTicker:  "KXTEST-26NOV01",
+					EventTitle:   "Test Market Event",
+					Category:     "other",
+					Markets:      make([]kalshi.KalshiMarket, 0, 12),
 				},
 			},
 		}
+		for i := 1; i <= 12; i++ {
+			resp.CurrentPage[0].Markets = append(resp.CurrentPage[0].Markets, kalshi.KalshiMarket{
+				Ticker:        fmt.Sprintf("KXTEST-26NOV01-T%d", i),
+				YesSubtitle:   fmt.Sprintf("Will test market %d resolve Yes?", i),
+				YesBidDollars: "0.44",
+				YesAskDollars: "0.46",
+				CloseTS:       "2026-11-01T00:00:00Z",
+				Status:        "open",
+			})
+		}
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
-			t.Errorf("mock server encode error: %v", err)
+			t.Fatalf("mock server encode error: %v", err)
 		}
 	}))
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	markets, err := client.FetchMarkets(context.Background(), "")
+	markets, err := client.FetchMarkets(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	// Only the valid market should be returned; the invalid one is skipped.
+	if len(markets) != venues.MaxMarketsPerVenue {
+		t.Fatalf("got %d markets, want %d", len(markets), venues.MaxMarketsPerVenue)
+	}
+	if markets[len(markets)-1].VenueID != "KXTEST-26NOV01-T10" {
+		t.Fatalf("last returned market = %q, want %q", markets[len(markets)-1].VenueID, "KXTEST-26NOV01-T10")
+	}
+}
+
+func TestKalshiFetchSkipsInvalidMarkets(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		resp := kalshi.SearchResponse{
+			CurrentPage: []kalshi.KalshiSeriesResult{
+				{
+					EventTicker: "KXGOOD-26NOV01",
+					EventTitle:  "Good Test Event",
+					Category:    "other",
+					Markets: []kalshi.KalshiMarket{
+						{
+							Ticker:        "KXGOOD-26NOV01-T1",
+							YesBidDollars: "0.50",
+							YesAskDollars: "0.52",
+							CloseTS:       "2026-11-01T00:00:00Z",
+							Status:        "open",
+							Volume:        50,
+						},
+						{
+							Ticker:        "",
+							YesBidDollars: "0.50",
+							YesAskDollars: "0.52",
+							CloseTS:       "2026-11-01T00:00:00Z",
+						},
+					},
+				},
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	markets, err := client.FetchMarkets(context.Background(), "good")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if len(markets) != 1 {
 		t.Errorf("got %d markets, want 1 (invalid market should be skipped)", len(markets))
 	}
 }
 
-// ---------------------------------------------------------------------------
-// TestNewKalshiClientRejectsMissingKeyFile — constructor fails gracefully
-// ---------------------------------------------------------------------------
+func TestKalshiSearchSeriesBuildsCursorRequest(t *testing.T) {
+	var capturedQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(kalshi.SearchResponse{})
+	}))
+	defer server.Close()
 
-func TestNewKalshiClientRejectsMissingKeyFile(t *testing.T) {
-	cfg := &config.Config{
-		KalshiBaseURL:    "http://localhost",
-		KalshiAPIKeyID:   "some-id",
-		KalshiAPIKeyPath: "/nonexistent/path/to/key.pem",
-		HTTPTimeout:      5 * time.Second,
+	client := newTestClient(t, server.URL)
+	_, err := client.SearchSeries(context.Background(), kalshi.SearchParams{
+		Query:    "bitcoin",
+		PageSize: 10,
+		Cursor:   "CAI",
+		OrderBy:  "querymatch",
+		Status:   "open",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
-	log := logger.New(io.Discard)
-	_, err := kalshi.NewKalshiClient(cfg, log)
-	if err == nil {
-		t.Fatal("expected error when key file does not exist, got nil")
+	if !contains(capturedQuery, "cursor=CAI") {
+		t.Errorf("request query = %q, want cursor parameter", capturedQuery)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// 429 retry behaviour
-// ---------------------------------------------------------------------------
+func TestKalshiGetSeriesDecodesResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(kalshi.SeriesResponse{
+			Series: []kalshi.SeriesDetail{{Ticker: "KXBTC", Title: "Bitcoin"}},
+		})
+	}))
+	defer server.Close()
 
-// TestKalshiRetryOn429ThenSuccess verifies that doSignedGet retries on 429
-// and succeeds once the server starts returning 200. The mock server returns
-// 429 on the first two attempts and 200 on the third. FetchMarkets must
-// return one market and the server must have been hit exactly three times.
+	client := newTestClient(t, server.URL)
+	series, err := client.GetSeries(context.Background(), "KXBTC")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(series) != 1 || series[0].Ticker != "KXBTC" {
+		t.Errorf("GetSeries() = %#v, want one KXBTC entry", series)
+	}
+}
+
 func TestKalshiRetryOn429ThenSuccess(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -425,14 +394,12 @@ func TestKalshiRetryOn429ThenSuccess(t *testing.T) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(oneEventResponse()); err != nil {
-			t.Errorf("mock server encode error: %v", err)
-		}
+		_ = json.NewEncoder(w).Encode(oneSearchResponse())
 	}))
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	markets, err := client.FetchMarkets(context.Background(), "")
+	markets, err := client.FetchMarkets(context.Background(), "test")
 	if err != nil {
 		t.Fatalf("expected success after retries, got error: %v", err)
 	}
@@ -440,13 +407,10 @@ func TestKalshiRetryOn429ThenSuccess(t *testing.T) {
 		t.Errorf("want 1 market, got %d", len(markets))
 	}
 	if got := int(attempts.Load()); got != 3 {
-		t.Errorf("want 3 server hits (2×429 + 1×200), got %d", got)
+		t.Errorf("want 3 server hits (2x429 + 1x200), got %d", got)
 	}
 }
 
-// TestKalshiRetryOn429ExhaustsRetries verifies that doSignedGet gives up
-// after maxRetries and returns an error when the server always returns 429.
-// The server must be hit exactly maxRetries+1 times (1 initial + 3 retries).
 func TestKalshiRetryOn429ExhaustsRetries(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -456,12 +420,24 @@ func TestKalshiRetryOn429ExhaustsRetries(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	_, err := client.FetchMarkets(context.Background(), "")
+	_, err := client.FetchMarkets(context.Background(), "test")
 	if err == nil {
 		t.Fatal("expected error after exhausting retries, got nil")
 	}
-	// 1 initial attempt + 3 retries = 4 total server hits.
 	if got := int(attempts.Load()); got != 4 {
 		t.Errorf("want 4 server hits (1 initial + 3 retries), got %d", got)
 	}
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
+}
+
+func containsHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

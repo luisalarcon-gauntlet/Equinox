@@ -150,15 +150,14 @@ func TestMatchResultHasAllRequiredFields(t *testing.T) {
 	b := models.Market{Venue: "polymarket", Title: "will btc reach 100000"}
 
 	mr := models.MatchResult{
-		MarketA:      a,
-		MarketB:      b,
-		IsMatch:      true,
-		AreOpposites: false,
-		Confidence:   0.92,
-		Method:       "heuristic",
-		Reasoning:    "identical entities and date",
-		Warnings:     []string{"stale data on kalshi"},
-		MatchedAt:    now,
+		MarketA:    a,
+		MarketB:    b,
+		IsMatch:    true,
+		Confidence: 0.92,
+		Method:     "heuristic",
+		Reasoning:  "identical entities and date",
+		Warnings:   []string{"stale data on kalshi"},
+		MatchedAt:  now,
 	}
 
 	if mr.MarketA.Venue != "kalshi" {
@@ -169,9 +168,6 @@ func TestMatchResultHasAllRequiredFields(t *testing.T) {
 	}
 	if !mr.IsMatch {
 		t.Error("IsMatch = false, want true")
-	}
-	if mr.AreOpposites {
-		t.Error("AreOpposites = true, want false")
 	}
 	if mr.Confidence != 0.92 {
 		t.Errorf("Confidence = %v, want 0.92", mr.Confidence)
@@ -189,32 +185,26 @@ func TestMatchResultHasAllRequiredFields(t *testing.T) {
 
 func TestMatchResultTableDriven(t *testing.T) {
 	tests := []struct {
-		name         string
-		isMatch      bool
-		areOpposites bool
-		confidence   float64
-		method       string
+		name       string
+		isMatch    bool
+		confidence float64
+		method     string
 	}{
-		{"heuristic match", true, false, 0.91, "heuristic"},
-		{"ai match", true, false, 0.85, "ai"},
-		{"heuristic+ai match", true, false, 0.78, "heuristic+ai"},
-		{"opposites", true, true, 0.88, "heuristic+ai"},
-		{"no match", false, false, 0.12, "heuristic"},
+		{"heuristic match", true, 0.91, "heuristic"},
+		{"ai match", true, 0.85, "ai"},
+		{"heuristic+ai match", true, 0.78, "heuristic+ai"},
+		{"no match", false, 0.12, "heuristic"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mr := models.MatchResult{
-				IsMatch:      tt.isMatch,
-				AreOpposites: tt.areOpposites,
-				Confidence:   tt.confidence,
-				Method:       tt.method,
+				IsMatch:    tt.isMatch,
+				Confidence: tt.confidence,
+				Method:     tt.method,
 			}
 			if mr.IsMatch != tt.isMatch {
 				t.Errorf("IsMatch = %v, want %v", mr.IsMatch, tt.isMatch)
-			}
-			if mr.AreOpposites != tt.areOpposites {
-				t.Errorf("AreOpposites = %v, want %v", mr.AreOpposites, tt.areOpposites)
 			}
 			if mr.Confidence != tt.confidence {
 				t.Errorf("Confidence = %v, want %v", mr.Confidence, tt.confidence)

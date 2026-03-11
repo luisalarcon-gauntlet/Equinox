@@ -176,6 +176,6 @@ This demonstrates the value of the canonical model and interface design.
 | UI Embedding    | embed (stdlib)          | Single binary deployment               |
 | UUID Generation | github.com/google/uuid  | Standard, well-tested                  |
 | Env Loading     | github.com/joho/godotenv| Standard Go env pattern                |
-| AI Layer        | Anthropic Claude Sonnet | Best-in-class reasoning for matching   |
+| AI Layer        | OpenAI GPT-4.1 nano     | Cheap, high-volume boolean classification |
 | Testing         | testing (stdlib)        | Go standard, table-driven              |
 | Build           | Makefile                | Simple, universal, no build tool needed|

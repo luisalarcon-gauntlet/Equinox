@@ -1,6 +1,6 @@
 # Project Equinox — local run with Docker Compose.
-# Run from the repo root (where .env lives):  docker compose up
-# Compose injects .env into the container so the app sees your keys.
+# Run from the repo root (where .env lives): docker compose up
+# Compose injects .env into the container so the app sees your settings.
 
 services:
   equinox:
@@ -9,9 +9,3 @@ services:
       - "8080:8080"
     env_file:
       - .env
-    environment:
-      # Path inside the container; key file is mounted from project root below.
-      - KALSHI_API_KEY_PATH=/app/kalshi_key.pem
-    volumes:
-      # Key in project root → same path the app reads in the container.
-      - ./kalshi_private_key.pem:/app/kalshi_key.pem

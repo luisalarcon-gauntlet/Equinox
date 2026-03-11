@@ -31,6 +31,21 @@ func (m *mockAIClient) EvaluateEquivalence(
 	return m.result, m.err
 }
 
+func (m *mockAIClient) EvaluateBatch(
+	_ context.Context,
+	pairs []ai.BatchPair,
+) ([]ai.EquivalenceResult, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	results := make([]ai.EquivalenceResult, len(pairs))
+	for i := range pairs {
+		m.called = true
+		results[i] = m.result
+	}
+	return results, nil
+}
+
 func detectorTestMarket(title string, resolvesAt time.Time) models.Market {
 	return models.Market{
 		ID:         "test-id",
@@ -48,31 +63,29 @@ func detectorTestMarket(title string, resolvesAt time.Time) models.Market {
 	}
 }
 
-func TestDetectorUsesHeuristicWhenConfident(t *testing.T) {
+func TestDetectorRejectsLowScoringPairWithoutAI(t *testing.T) {
 	log := logger.New(io.Discard)
 	mock := &mockAIClient{}
 
-	// Identical titles with the same date → heuristic confidence ≥ 0.80
-	// → AI must NOT be called.
-	date := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
-	title := "will democrats control the house 2026"
-
+	// Completely unrelated titles with zero dates → entity overlap = 0, date score = 0
+	// → combined score = 0.0 < tierRejectCeiling (0.25) → tier-1 hard reject.
+	// AI must NOT be called.
 	detector := equivalence.NewDetector(0.80, mock, log)
-	marketA := detectorTestMarket(title, date)
-	marketB := detectorTestMarket(title, date)
+	marketA := detectorTestMarket("will btc exceed 100k by year end", time.Time{})
+	marketB := detectorTestMarket("who wins the democratic primary", time.Time{})
 
 	result, err := detector.Detect(context.Background(), marketA, marketB)
 	if err != nil {
 		t.Fatalf("Detect() error = %v", err)
 	}
-	if !result.IsMatch {
-		t.Errorf("IsMatch = false, want true for identical titles")
+	if result.IsMatch {
+		t.Errorf("IsMatch = true, want false for definitively unrelated titles")
 	}
-	if result.Method != "heuristic" {
-		t.Errorf("Method = %q, want 'heuristic'", result.Method)
+	if result.Method != "heuristic_reject" {
+		t.Errorf("Method = %q, want 'heuristic_reject'", result.Method)
 	}
 	if mock.called {
-		t.Errorf("AI layer was called — should not be called when heuristic is confident")
+		t.Errorf("AI layer was called — must not be called when heuristic rejects")
 	}
 }
 
@@ -80,11 +93,10 @@ func TestDetectorEscalatesToAIWhenHeuristicLow(t *testing.T) {
 	log := logger.New(io.Discard)
 	mock := &mockAIClient{
 		result: ai.EquivalenceResult{
-			IsEquivalent: true,
-			AreOpposites: true,
-			Confidence:   0.93,
-			Reasoning:    "opposite sides of the same House race",
-			UsedAILayer:  true,
+			IsMatch:     true,
+			Confidence:  0.93,
+			Reasoning:   "same House race",
+			UsedAILayer: true,
 		},
 	}
 
@@ -108,9 +120,6 @@ func TestDetectorEscalatesToAIWhenHeuristicLow(t *testing.T) {
 	if !result.IsMatch {
 		t.Errorf("IsMatch = false, want true (AI confirmed match)")
 	}
-	if !result.AreOpposites {
-		t.Errorf("AreOpposites = false, want true")
-	}
 }
 
 func TestDetectorFallsBackGracefullyWhenAIUnavailable(t *testing.T) {
@@ -119,12 +128,12 @@ func TestDetectorFallsBackGracefullyWhenAIUnavailable(t *testing.T) {
 		err: errors.New("connection refused"),
 	}
 
-	// Low heuristic confidence + AI failure → return heuristic result with warning.
+	// Medium-confidence pair + AI failure → return heuristic-only result with warning.
 	date := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
 	detector := equivalence.NewDetector(0.80, mock, log)
 
-	marketA := detectorTestMarket("will the gop control the house 2026", date)
-	marketB := detectorTestMarket("will democrats control the house 2026", date)
+	marketA := detectorTestMarket("will btc price exceed 100000 in 2026", date)
+	marketB := detectorTestMarket("bitcoin above 100k end of year 2026", date)
 
 	result, err := detector.Detect(context.Background(), marketA, marketB)
 	// Graceful degradation — no error propagated, just a warning in the result.
@@ -180,15 +189,14 @@ func TestDetectorResultHasReasoning(t *testing.T) {
 	}
 }
 
-func TestDetectorAIResultOppositesFlagPreserved(t *testing.T) {
+func TestDetectorAIResultPreservesBooleanMatch(t *testing.T) {
 	log := logger.New(io.Discard)
 	mock := &mockAIClient{
 		result: ai.EquivalenceResult{
-			IsEquivalent: true,
-			AreOpposites: true,
-			Confidence:   0.94,
-			Reasoning:    "mirror image markets",
-			UsedAILayer:  true,
+			IsMatch:     true,
+			Confidence:  0.94,
+			Reasoning:   "same underlying market",
+			UsedAILayer: true,
 		},
 	}
 
@@ -203,7 +211,7 @@ func TestDetectorAIResultOppositesFlagPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Detect() error = %v", err)
 	}
-	if !result.AreOpposites {
-		t.Errorf("AreOpposites = false, want true — AI result AreOpposites flag must be preserved")
+	if !result.IsMatch {
+		t.Errorf("IsMatch = false, want true — AI result boolean match must be preserved")
 	}
 }

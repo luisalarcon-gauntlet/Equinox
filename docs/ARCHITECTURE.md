@@ -62,14 +62,12 @@ This is infrastructure research and a technical prototype.
 │                          ▼                                       │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │ AI Tool Layer  (equivalence/tools/ + ai/client.go)       │   │
-│  │  • check_opposites  — mirror image markets               │   │
 │  │  • check_synonyms   — GOP = Republicans                  │   │
 │  │  • check_entity_match — named entity overlap             │   │
 │  │  • check_date_alignment — resolution date proximity      │   │
 │  │  • check_structural — question structure comparison      │   │
-│  │  Tools run in parallel → results sent to Claude          │   │
-│  │  Claude returns: is_equivalent, are_opposites,           │   │
-│  │    confidence, reasoning                                 │   │
+│  │  Tools run in parallel → compact signals sent to OpenAI  │   │
+│  │  OpenAI returns: is_match, confidence, reasoning         │   │
 │  └──────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -96,7 +94,7 @@ heuristic confidence falls below 0.80. This decision is logged and auditable.
 
 **Why:**
 - Cost: ~95% of pairs can be decided without an API call.
-- Latency: heuristic matching is microseconds; Claude is ~1–3 seconds.
+- Latency: heuristic matching is microseconds; `gpt-4.1-nano` is a low-latency fallback.
 - Auditability: every decision has a logged reason (`Method` field).
 - Resilience: AI unavailability degrades gracefully to heuristic-only.
 
@@ -147,7 +145,7 @@ functions, no package-level variables that mutate at runtime.
 |--------|-----------|
 | **Go 1.22** | Aligns with Peak6's internal stack. Strong typing enforces canonical model at compile time. Goroutine model fits parallel API requests. |
 | **Standard library HTTP** | No external framework dependencies. `net/http` is production-grade and well-understood. |
-| **Anthropic Claude Sonnet** | Best-in-class reasoning for nuanced semantic equivalence. The specific model (`claude-sonnet-4-20250514`) is configurable. |
+| **OpenAI GPT-4.1 nano** | Cheap, high-volume classification for ambiguous market pairs. |
 | **UUID v5 for market IDs** | Deterministic IDs from venue ticker strings. The same market always gets the same internal ID across fetches, enabling cache deduplication. |
 | **`godotenv`** | Developer convenience only — production deployments set env vars directly. |
 | **`google/uuid`** | Minimal, well-maintained UUID library. Single transitive dependency. |
@@ -188,11 +186,12 @@ evaluation to a smarter pre-filtering approach before calling the detector.
 
 All configuration is loaded from environment variables at startup. See
 `.env.example` for the full list. Sensible defaults are applied for all
-optional fields; only `ANTHROPIC_API_KEY` is required.
+optional fields; only `OPENAI_API_KEY` is required.
 
 ```go
 type Config struct {
-    AnthropicAPIKey              string        // required
+    OpenAIAPIKey                 string        // required
+    OpenAIBaseURL                string        // default: OpenAI API
     KalshiBaseURL                string        // default: Kalshi production API
     PolymarketBaseURL            string        // default: Polymarket Gamma API
     HTTPTimeout                  time.Duration // default: 10s

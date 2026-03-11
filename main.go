@@ -9,7 +9,6 @@
 package main
 
 import (
-	"context"
 	"embed"
 	"fmt"
 	"io/fs"
@@ -57,22 +56,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Pre-warm the series cache so the first search uses targeted fetching.
-	// Non-fatal: the system falls back to the full catalogue scan if this fails.
-	if err := kalshiClient.WarmSeriesCache(context.Background()); err != nil {
-		log.Warn("main", "kalshi",
-			fmt.Sprintf("series cache pre-warm failed; will use full catalogue scan: %v", err))
-	}
-
 	polyClient := polymarket.NewPolymarketClient(cfg, log)
 
 	connectors := []venues.VenueConnector{kalshiClient, polyClient}
 
 	// ── 4. AI client ─────────────────────────────────────────────────────────
-	// baseURL is empty here — NewAnthropicClient defaults to api.anthropic.com.
-	aiClient, err := aipackage.NewAnthropicClient(cfg, log, "")
+	aiClient, err := aipackage.NewOpenAIClient(cfg, log, "")
 	if err != nil {
-		log.Error("main", "anthropic", "failed to initialise AI client", err)
+		log.Error("main", "openai", "failed to initialise AI client", err)
 		os.Exit(1)
 	}
 
