@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"time"
 
 	equinoxerrors "github.com/equinox/errors"
@@ -22,6 +23,7 @@ type Config struct {
 	ServerPort                   string
 	HeuristicConfidenceThreshold float64
 	PriceDataStalenessThreshold  time.Duration
+	MatchesMinConfidence         float64 // MATCHES_MIN_CONFIDENCE — minimum confidence for cross-venue DB matches
 }
 
 // Load reads configuration from environment variables and applies defaults.
@@ -55,6 +57,7 @@ func Load() (*Config, error) {
 		HTTPTimeout:                  envDurationOrDefault("HTTP_TIMEOUT", 10*time.Second),
 		HeuristicConfidenceThreshold: 0.80,
 		PriceDataStalenessThreshold:  envDurationOrDefault("PRICE_STALENESS_THRESHOLD", 2*time.Minute),
+		MatchesMinConfidence:         envFloat64OrDefault("MATCHES_MIN_CONFIDENCE", 0.60),
 	}
 
 	return cfg, nil
@@ -77,4 +80,16 @@ func envDurationOrDefault(key string, defaultVal time.Duration) time.Duration {
 		return defaultVal
 	}
 	return d
+}
+
+func envFloat64OrDefault(key string, defaultVal float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return defaultVal
+	}
+	return f
 }

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -16,6 +17,7 @@ import (
 	equinoxerrors "github.com/equinox/errors"
 	"github.com/equinox/logger"
 	"github.com/equinox/models"
+	"github.com/equinox/trace"
 	"github.com/equinox/venues"
 	"github.com/equinox/venues/kalshidb"
 )
@@ -37,17 +39,19 @@ const (
 // and adapts nested search results into canonical models.Market values.
 // When kalshidb is set, FetchMarkets tries KalshiDB first and falls back to v1 search.
 type KalshiClient struct {
-	httpClient     *http.Client
-	baseURL        string
-	log            *logger.Logger
-	rateLimiter    *rate.Limiter
-	retryBaseDelay time.Duration
-	kalshidb       *kalshidb.Client
+	httpClient           *http.Client
+	baseURL              string
+	log                  *logger.Logger
+	rateLimiter          *rate.Limiter
+	retryBaseDelay       time.Duration
+	kalshidb             *kalshidb.Client
+	matchesMinConfidence float64
 }
 
 // NewKalshiClient constructs a v1 Kalshi client. Read endpoints are
 // unauthenticated, so no key material is required.
-// If cfg.KalshiDBAPIKey is set, the client will use KalshiDB for search first.
+// If cfg.KalshiDBAPIKey is set, the client will use KalshiDB for search first
+// and enrich results with cross-venue match data.
 func NewKalshiClient(cfg *config.Config, log *logger.Logger) (*KalshiClient, error) {
 	c := &KalshiClient{
 		httpClient: &http.Client{
@@ -58,10 +62,11 @@ func NewKalshiClient(cfg *config.Config, log *logger.Logger) (*KalshiClient, err
 				ExpectContinueTimeout: 1 * time.Second,
 			},
 		},
-		baseURL:        strings.TrimRight(cfg.KalshiBaseURL, "/"),
-		log:            log,
-		rateLimiter:    rate.NewLimiter(rate.Every(60*time.Millisecond), 3),
-		retryBaseDelay: 500 * time.Millisecond,
+		baseURL:              strings.TrimRight(cfg.KalshiBaseURL, "/"),
+		log:                  log,
+		rateLimiter:          rate.NewLimiter(rate.Every(60*time.Millisecond), 3),
+		retryBaseDelay:       500 * time.Millisecond,
+		matchesMinConfidence: cfg.MatchesMinConfidence,
 	}
 	if cfg.KalshiDBAPIKey != "" {
 		c.kalshidb = kalshidb.NewClient(cfg.KalshiDBBaseURL, cfg.KalshiDBAPIKey, cfg.HTTPTimeout, log)
@@ -103,8 +108,12 @@ func (c *KalshiClient) FetchMarkets(ctx context.Context, query string) ([]models
 
 const kalshiDBSearchLimit = 10
 
-// fetchMarketsViaKalshiDB searches KalshiDB (limit 10), fetches each event by kalshi_url, adapts to markets.
+// fetchMarketsViaKalshiDB searches KalshiDB (limit 10), fetches each event by
+// kalshi_url for live prices, then concurrently looks up cross-venue matches and
+// attaches CrossVenueURL/Confidence/MatchType to each market that has one.
 func (c *KalshiClient) fetchMarketsViaKalshiDB(ctx context.Context, query string) ([]models.Market, int) {
+	qt := trace.FromContext(ctx)
+
 	sr, err := c.kalshidb.Search(ctx, query, kalshiDBSearchLimit)
 	if err != nil {
 		c.log.Warn("connector", "kalshi", fmt.Sprintf("KalshiDB search failed, falling back to search: %v", err))
@@ -114,9 +123,26 @@ func (c *KalshiClient) fetchMarketsViaKalshiDB(ctx context.Context, query string
 		return nil, 0
 	}
 
+	qt.Add(fmt.Sprintf("kalshi: kalshidb-search → %d events", len(sr.Results)))
+
 	seenTickers := make(map[string]struct{})
 	var markets []models.Market
 	eventsUsed := 0
+
+	// matchesByTicker holds the best match for each event ticker, populated
+	// concurrently below after live price fetching is complete.
+	type matchResult struct {
+		ticker  string
+		entries []kalshidb.MatchEntry
+		err     error
+	}
+
+	// Collect tickers that we successfully adapt so we can look up matches.
+	type adaptedEvent struct {
+		ticker  string
+		markets []models.Market
+	}
+	var adaptedEvents []adaptedEvent
 
 	for _, res := range sr.Results {
 		if res.KalshiURL == "" {
@@ -134,16 +160,90 @@ func (c *KalshiClient) fetchMarketsViaKalshiDB(ctx context.Context, query string
 			c.log.Warn("connector", "kalshi", fmt.Sprintf("adapt event %q: %v", evResp.Event.EventTicker, err))
 			continue
 		}
+
+		var fresh []models.Market
 		for _, m := range eventMarkets {
 			if _, seen := seenTickers[m.VenueID]; seen {
 				continue
 			}
 			seenTickers[m.VenueID] = struct{}{}
+			fresh = append(fresh, m)
+		}
+		if len(fresh) > 0 {
+			adaptedEvents = append(adaptedEvents, adaptedEvent{
+				ticker:  res.EventTicker,
+				markets: fresh,
+			})
+		}
+	}
+
+	// Concurrently fetch cross-venue matches for every adapted event.
+	matchCh := make(chan matchResult, len(adaptedEvents))
+	var wg sync.WaitGroup
+	for _, ae := range adaptedEvents {
+		wg.Add(1)
+		go func(ticker string) {
+			defer wg.Done()
+			entries, err := c.kalshidb.GetMatches(ctx, ticker, c.matchesMinConfidence)
+			matchCh <- matchResult{ticker: ticker, entries: entries, err: err}
+		}(ae.ticker)
+	}
+	wg.Wait()
+	close(matchCh)
+
+	// Build a lookup: event ticker → best MatchEntry (first = highest confidence
+	// because the API returns matches sorted by confidence descending).
+	matchesByTicker := make(map[string]kalshidb.MatchEntry)
+	for mr := range matchCh {
+		if mr.err != nil {
+			c.log.Warn("connector", "kalshi",
+				fmt.Sprintf("GetMatches failed for ticker=%s: %v", mr.ticker, mr.err))
+			continue
+		}
+		if len(mr.entries) > 0 {
+			matchesByTicker[mr.ticker] = mr.entries[0]
+			c.log.Info("connector", "kalshi",
+				fmt.Sprintf("match ticker=%s → poly_event=%s confidence=%.2f type=%s",
+					mr.ticker, mr.entries[0].PolyEventID,
+					mr.entries[0].Confidence, mr.entries[0].MatchType))
+		}
+	}
+
+	// Assemble the final market slice, attaching cross-venue data where available.
+	matchedCount := 0
+	bestConfidence := 0.0
+	bestMatchType := ""
+
+	for _, ae := range adaptedEvents {
+		entry, hasMatch := matchesByTicker[ae.ticker]
+		for _, m := range ae.markets {
+			if hasMatch && entry.PolyClobURL != "" {
+				m.CrossVenueURL = entry.PolyClobURL
+				m.CrossVenueConfidence = entry.Confidence
+				m.CrossVenueMatchType = entry.MatchType
+			}
 			markets = append(markets, m)
 			if len(markets) >= venues.MaxMarketsPerVenue {
-				return markets, eventsUsed
+				goto done
 			}
 		}
+		if hasMatch {
+			matchedCount++
+			if entry.Confidence > bestConfidence {
+				bestConfidence = entry.Confidence
+				bestMatchType = entry.MatchType
+			}
+		}
+	}
+
+done:
+	c.log.Info("connector", "kalshi",
+		fmt.Sprintf("enriched %d/%d events with cross-venue matches", matchedCount, len(adaptedEvents)))
+
+	if matchedCount > 0 {
+		qt.Add(fmt.Sprintf("kalshi: matches → %d matched (best: %s %.2f)", matchedCount, bestMatchType, bestConfidence))
+	} else {
+		qt.Add("kalshi: matches → none found")
 	}
 
 	return markets, eventsUsed

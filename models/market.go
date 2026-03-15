@@ -37,6 +37,14 @@ type Market struct {
 	Category string // "politics", "economics", "crypto", "sports", "other"
 	Status   string // "open", "closed", "resolved"
 
+	// Cross-venue pre-computed match — set by the KalshiDB path on Kalshi markets
+	// when /v1/matches/{ticker} returns a result above the configured threshold.
+	// These fields allow the equivalence detector to short-circuit expensive
+	// heuristic + AI evaluation for already-known high-confidence pairs.
+	CrossVenueURL        string  // poly_clob_url of the matched Polymarket market
+	CrossVenueConfidence float64 // 0.0 – 1.0 from /v1/matches
+	CrossVenueMatchType  string  // "exact", "related", or "same_topic"
+
 	// Debug — always preserve the original API response for auditability
 	RawData interface{}
 }
@@ -67,6 +75,7 @@ type SearchResponse struct {
 	NoMatchesAboveThreshold bool              `json:"no_matches_above_threshold"`
 	Message                 string            `json:"message,omitempty"`
 	Suggestions             SearchSuggestions `json:"suggestions"`
+	QueryPath               []string          `json:"query_path,omitempty"` // ordered trace of which path the query took through the system
 }
 
 // VenueScore is the routing engine's score for one venue on a given market.

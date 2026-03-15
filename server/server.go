@@ -16,6 +16,7 @@ import (
 	equinoxerrors "github.com/equinox/errors"
 	"github.com/equinox/logger"
 	"github.com/equinox/models"
+	"github.com/equinox/trace"
 	"github.com/equinox/venues"
 )
 
@@ -204,7 +205,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
+	ctx, qt := trace.NewContext(r.Context())
 
 	// Fetch from all connectors in parallel.
 	type venueResult struct {
@@ -247,6 +248,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 				Kalshi:     sanitizeMarkets(top3(kalshiMarkets)),
 				Polymarket: sanitizeMarkets(top3(polyMarkets)),
 			},
+			QueryPath: qt.Steps(),
 		}
 		writeJSON(w, http.StatusOK, resp)
 		return
@@ -283,11 +285,13 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 				Kalshi:     sanitizeMarkets(top3(kalshiMarkets)),
 				Polymarket: sanitizeMarkets(top3(polyMarkets)),
 			},
+			QueryPath: qt.Steps(),
 		}
 	} else {
 		resp = models.SearchResponse{
 			Matches:     sanitized,
 			Suggestions: models.SearchSuggestions{},
+			QueryPath:   qt.Steps(),
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)

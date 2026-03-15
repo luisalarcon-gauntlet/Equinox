@@ -141,7 +141,7 @@ func buildServer(
 	if err != nil {
 		t.Fatalf("NewKalshiClient: %v", err)
 	}
-	polyClient := polymarket.NewPolymarketClient(cfg, log)
+	polyClient := polymarket.NewPolymarketClient(cfg, log, nil)
 	connectors := []venues.VenueConnector{kalshiClient, polyClient}
 
 	detector := equivalence.NewDetector(cfg.HeuristicConfidenceThreshold, aiClient, log)

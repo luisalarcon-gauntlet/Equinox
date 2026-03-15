@@ -24,6 +24,7 @@ import (
 	"github.com/equinox/server"
 	"github.com/equinox/venues"
 	"github.com/equinox/venues/kalshi"
+	kalshidbpkg "github.com/equinox/venues/kalshidb"
 	"github.com/equinox/venues/polymarket"
 )
 
@@ -56,7 +57,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	polyClient := polymarket.NewPolymarketClient(cfg, log)
+	// Build the optional KalshiDB client. When configured it is shared by both
+	// venue connectors: Kalshi uses it for event search + match enrichment;
+	// Polymarket uses it for DB-backed search + CLOB pricing.
+	var dbClient *kalshidbpkg.Client
+	if cfg.KalshiDBAPIKey != "" {
+		dbClient = kalshidbpkg.NewClient(cfg.KalshiDBBaseURL, cfg.KalshiDBAPIKey, cfg.HTTPTimeout, log)
+		log.Info("main", "", fmt.Sprintf("polymarketdb: enabled (base=%s, min_confidence=%.2f)",
+			cfg.KalshiDBBaseURL, cfg.MatchesMinConfidence))
+	}
+
+	polyClient := polymarket.NewPolymarketClient(cfg, log, dbClient)
 
 	connectors := []venues.VenueConnector{kalshiClient, polyClient}
 

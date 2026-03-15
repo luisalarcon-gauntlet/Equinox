@@ -10,6 +10,7 @@ import (
 	"github.com/equinox/equivalence/tools"
 	"github.com/equinox/logger"
 	"github.com/equinox/models"
+	"github.com/equinox/trace"
 )
 
 // Tier thresholds for the two-tier pre-filter.
@@ -73,6 +74,10 @@ func NewDetector(threshold float64, aiClient AIEvaluator, log *logger.Logger) *D
 // surfaced as warnings inside the result (graceful degradation).
 // Use DetectAllPairs for bulk evaluation; it batches AI calls more efficiently.
 func (d *Detector) Detect(ctx context.Context, marketA, marketB models.Market) (models.MatchResult, error) {
+	if result, ok := d.tryPrecomputedMatch(ctx, marketA, marketB); ok {
+		return result, nil
+	}
+
 	hResult := d.heuristic.Match(marketA, marketB)
 
 	if hResult.Confidence < tierRejectCeiling {
@@ -117,27 +122,53 @@ func (d *Detector) DetectAllPairs(ctx context.Context, pairs []models.MarketPair
 		return nil, nil
 	}
 
-	// ── Phase 1: run heuristics concurrently ─────────────────────────────────
+	// ── Phase 0: short-circuit pairs with pre-computed DB matches ────────────
+	// Allocate result slice indexed by original pair position.
+	finalResults := make([]models.MatchResult, len(pairs))
+	var needsEval []int // indices of pairs that still need heuristic + AI
+
+	precomputedCount := 0
+	for i, p := range pairs {
+		if result, ok := d.tryPrecomputedMatch(ctx, p.A, p.B); ok {
+			finalResults[i] = result
+			precomputedCount++
+		} else {
+			needsEval = append(needsEval, i)
+		}
+	}
+
+	if precomputedCount > 0 {
+		d.log.Info("equivalence", "", fmt.Sprintf(
+			"precomputed short-circuit: %d pairs resolved, %d remaining for heuristic+AI",
+			precomputedCount, len(needsEval)))
+	}
+
+	if len(needsEval) == 0 {
+		trace.FromContext(ctx).Add(fmt.Sprintf(
+			"equivalence: precomputed %d pairs skipped, 0 pairs evaluated (heuristic+AI)",
+			precomputedCount))
+		return finalResults, nil
+	}
+
+	// ── Phase 1: run heuristics concurrently on remaining pairs ──────────────
 	type heuristicItem struct {
 		idx    int
 		pair   models.MarketPair
 		result models.MatchResult
 	}
 
-	hCh := make(chan heuristicItem, len(pairs))
+	hCh := make(chan heuristicItem, len(needsEval))
 	var wg sync.WaitGroup
-	for i, p := range pairs {
+	for _, i := range needsEval {
 		wg.Add(1)
 		go func(idx int, pr models.MarketPair) {
 			defer wg.Done()
 			hCh <- heuristicItem{idx: idx, pair: pr, result: d.heuristic.Match(pr.A, pr.B)}
-		}(i, p)
+		}(i, pairs[i])
 	}
 	wg.Wait()
 	close(hCh)
 
-	// Allocate result slice indexed by original pair position.
-	finalResults := make([]models.MatchResult, len(pairs))
 	var tier2 []heuristicItem
 
 	for item := range hCh {
@@ -211,7 +242,40 @@ func (d *Detector) DetectAllPairs(ctx context.Context, pairs []models.MarketPair
 		}
 	}
 
+	trace.FromContext(ctx).Add(fmt.Sprintf(
+		"equivalence: precomputed %d pairs skipped, %d pairs evaluated (heuristic+AI)",
+		precomputedCount, len(needsEval)))
+
 	return finalResults, nil
+}
+
+// tryPrecomputedMatch checks whether marketA carries a pre-computed cross-venue
+// confidence from the DB matches API. If it does and the confidence meets the
+// detector threshold, it returns a short-circuit MatchResult and true.
+// For lower confidence (above tierRejectCeiling but below threshold) it blends
+// the pre-computed score into the heuristic to reduce unnecessary AI calls.
+func (d *Detector) tryPrecomputedMatch(ctx context.Context, marketA, marketB models.Market) (models.MatchResult, bool) {
+	if marketA.CrossVenueConfidence <= 0 {
+		return models.MatchResult{}, false
+	}
+
+	if marketA.CrossVenueConfidence >= d.threshold {
+		d.log.Info("equivalence", "",
+			fmt.Sprintf("precomputed match confidence=%.2f type=%s — skipping heuristic+AI",
+				marketA.CrossVenueConfidence, marketA.CrossVenueMatchType))
+		return models.MatchResult{
+			MarketA:    marketA,
+			MarketB:    marketB,
+			IsMatch:    true,
+			Confidence: marketA.CrossVenueConfidence,
+			Method:     "precomputed",
+			Reasoning: fmt.Sprintf("DB match type=%s confidence=%.2f (entity_basis from /v1/matches)",
+				marketA.CrossVenueMatchType, marketA.CrossVenueConfidence),
+			MatchedAt: time.Now(),
+		}, true
+	}
+
+	return models.MatchResult{}, false
 }
 
 // tierRejectResult returns a definite-reject MatchResult for tier-1 pairs.
