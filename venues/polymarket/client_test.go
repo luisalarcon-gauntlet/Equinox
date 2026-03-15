@@ -163,10 +163,11 @@ func TestFetchMarkets_InactiveEventSkipped(t *testing.T) {
 	}
 }
 
-func TestFetchMarkets_LimitsToTopTenMarkets(t *testing.T) {
+func TestFetchMarkets_LimitsToMaxMarketsPerVenue(t *testing.T) {
 	future := time.Now().Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339)
-	markets := make([]Market, 0, 12)
-	for i := 1; i <= 12; i++ {
+	n := venues.MaxMarketsPerVenue + 5
+	markets := make([]Market, 0, n)
+	for i := 1; i <= n; i++ {
 		markets = append(markets, Market{
 			ID:            "market-" + strconv.Itoa(i),
 			Question:      "Will test outcome " + strconv.Itoa(i) + " happen in 2027?",
@@ -192,7 +193,8 @@ func TestFetchMarkets_LimitsToTopTenMarkets(t *testing.T) {
 	if len(got) != venues.MaxMarketsPerVenue {
 		t.Fatalf("got %d markets, want %d", len(got), venues.MaxMarketsPerVenue)
 	}
-	if got[len(got)-1].VenueID != "market-10" {
-		t.Fatalf("last returned market = %q, want %q", got[len(got)-1].VenueID, "market-10")
+	wantLast := "market-" + strconv.Itoa(venues.MaxMarketsPerVenue)
+	if got[len(got)-1].VenueID != wantLast {
+		t.Fatalf("last returned market = %q, want %q", got[len(got)-1].VenueID, wantLast)
 	}
 }

@@ -15,6 +15,8 @@ type Config struct {
 	OpenAIAPIKey                 string
 	OpenAIBaseURL                string
 	KalshiBaseURL                string
+	KalshiDBBaseURL              string
+	KalshiDBAPIKey               string
 	PolymarketBaseURL            string
 	HTTPTimeout                  time.Duration
 	ServerPort                   string
@@ -46,6 +48,8 @@ func Load() (*Config, error) {
 		OpenAIAPIKey:                 apiKey,
 		OpenAIBaseURL:                envOrDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"),
 		KalshiBaseURL:                envOrDefault("KALSHI_BASE_URL", "https://api.elections.kalshi.com"),
+		KalshiDBBaseURL:              envOrDefault("KALSHI_DB_BASE_URL", "http://localhost:8000"),
+		KalshiDBAPIKey:               os.Getenv("KALSHI_DB_API_KEY"),
 		PolymarketBaseURL:            envOrDefault("POLYMARKET_BASE_URL", "https://gamma-api.polymarket.com"),
 		ServerPort:                   serverPort,
 		HTTPTimeout:                  envDurationOrDefault("HTTP_TIMEOUT", 10*time.Second),

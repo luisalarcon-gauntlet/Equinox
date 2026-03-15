@@ -137,3 +137,48 @@ type RawSearchMarket struct {
 	Series KalshiSeriesResult `json:"series"`
 	Market KalshiMarket       `json:"market"`
 }
+
+// V2EventResponse is the response from GET trade-api/v2/events/{ticker}?with_nested_markets=true.
+// Markets are nested inside the event when with_nested_markets=true.
+type V2EventResponse struct {
+	Event V2Event `json:"event"`
+}
+
+// V2Event is the event object in the v2 API. Field names follow Kalshi's API.
+type V2Event struct {
+	EventTicker   string       `json:"event_ticker"`
+	SeriesTicker  string       `json:"series_ticker"`
+	Title         string       `json:"title"`
+	SubTitle      string       `json:"sub_title"`
+	Category      string       `json:"category"`
+	Markets       []V2Market   `json:"markets"`
+}
+
+// V2Market is one market in the v2 event's nested markets array.
+// Aligned with v1 KalshiMarket where possible for adapter reuse.
+type V2Market struct {
+	Ticker string `json:"ticker"`
+
+	YesSubtitle string `json:"yes_subtitle"`
+	NoSubtitle  string `json:"no_subtitle"`
+
+	YesBid    int `json:"yes_bid"`
+	YesAsk    int `json:"yes_ask"`
+	LastPrice int `json:"last_price"`
+
+	YesBidDollars    string `json:"yes_bid_dollars"`
+	YesAskDollars    string `json:"yes_ask_dollars"`
+	LastPriceDollars string `json:"last_price_dollars"`
+
+	Volume int64 `json:"volume"`
+
+	CloseTS               string `json:"close_ts"`
+	ExpectedExpirationTS  string `json:"expected_expiration_ts"`
+	OpenTS                string `json:"open_ts"`
+
+	Status string `json:"status"`
+	Result string `json:"result"`
+
+	CustomStrike      map[string]string `json:"custom_strike"`
+	RulebookVariables map[string]string `json:"rulebook_variables"`
+}

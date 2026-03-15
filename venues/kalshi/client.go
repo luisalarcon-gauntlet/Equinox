@@ -17,6 +17,7 @@ import (
 	"github.com/equinox/logger"
 	"github.com/equinox/models"
 	"github.com/equinox/venues"
+	"github.com/equinox/venues/kalshidb"
 )
 
 const (
@@ -34,18 +35,21 @@ const (
 
 // KalshiClient fetches market data from Kalshi's unauthenticated v1 search API
 // and adapts nested search results into canonical models.Market values.
+// When kalshidb is set, FetchMarkets tries KalshiDB first and falls back to v1 search.
 type KalshiClient struct {
 	httpClient     *http.Client
 	baseURL        string
 	log            *logger.Logger
 	rateLimiter    *rate.Limiter
 	retryBaseDelay time.Duration
+	kalshidb       *kalshidb.Client
 }
 
 // NewKalshiClient constructs a v1 Kalshi client. Read endpoints are
 // unauthenticated, so no key material is required.
+// If cfg.KalshiDBAPIKey is set, the client will use KalshiDB for search first.
 func NewKalshiClient(cfg *config.Config, log *logger.Logger) (*KalshiClient, error) {
-	return &KalshiClient{
+	c := &KalshiClient{
 		httpClient: &http.Client{
 			Timeout: cfg.HTTPTimeout,
 			Transport: &http.Transport{
@@ -58,20 +62,95 @@ func NewKalshiClient(cfg *config.Config, log *logger.Logger) (*KalshiClient, err
 		log:            log,
 		rateLimiter:    rate.NewLimiter(rate.Every(60*time.Millisecond), 3),
 		retryBaseDelay: 500 * time.Millisecond,
-	}, nil
+	}
+	if cfg.KalshiDBAPIKey != "" {
+		c.kalshidb = kalshidb.NewClient(cfg.KalshiDBBaseURL, cfg.KalshiDBAPIKey, cfg.HTTPTimeout, log)
+	}
+	return c, nil
 }
 
 // GetVenueName satisfies the VenueConnector interface.
 func (c *KalshiClient) GetVenueName() string { return "kalshi" }
 
-// FetchMarkets queries /v1/search/series and adapts nested market results into
-// canonical models.Market values. We fetch a few ranked result pages so broad
-// queries still surface enough candidates for downstream matching.
+// FetchMarkets returns markets matching the query. When KalshiDB is configured,
+// it searches KalshiDB first (limit 10 events), enriches each via kalshi_url for
+// live prices, then returns those markets and logs source=kalshidb. If KalshiDB
+// returns nothing or all event fetches fail, it falls back to v1 search/series
+// and logs source=search.
 func (c *KalshiClient) FetchMarkets(ctx context.Context, query string) ([]models.Market, error) {
 	if strings.TrimSpace(query) == "" {
 		return []models.Market{}, nil
 	}
 
+	if c.kalshidb != nil {
+		markets, eventsUsed := c.fetchMarketsViaKalshiDB(ctx, query)
+		if len(markets) > 0 {
+			c.log.Info("connector", "kalshi",
+				fmt.Sprintf("kalshi source=kalshidb query=%q events=%d markets=%d", query, eventsUsed, len(markets)))
+			return markets, nil
+		}
+		// Fallback to v1 search
+	}
+
+	markets, err := c.fetchMarketsViaSearchSeries(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	c.log.Info("connector", "kalshi",
+		fmt.Sprintf("kalshi source=search query=%q markets=%d", query, len(markets)))
+	return markets, nil
+}
+
+const kalshiDBSearchLimit = 10
+
+// fetchMarketsViaKalshiDB searches KalshiDB (limit 10), fetches each event by kalshi_url, adapts to markets.
+func (c *KalshiClient) fetchMarketsViaKalshiDB(ctx context.Context, query string) ([]models.Market, int) {
+	sr, err := c.kalshidb.Search(ctx, query, kalshiDBSearchLimit)
+	if err != nil {
+		c.log.Warn("connector", "kalshi", fmt.Sprintf("KalshiDB search failed, falling back to search: %v", err))
+		return nil, 0
+	}
+	if sr == nil || len(sr.Results) == 0 {
+		return nil, 0
+	}
+
+	seenTickers := make(map[string]struct{})
+	var markets []models.Market
+	eventsUsed := 0
+
+	for _, res := range sr.Results {
+		if res.KalshiURL == "" {
+			continue
+		}
+		evResp, err := c.FetchEventByURL(ctx, res.KalshiURL)
+		if err != nil {
+			c.log.Warn("connector", "kalshi",
+				fmt.Sprintf("fetch event %q failed: %v", res.EventTicker, err))
+			continue
+		}
+		eventsUsed++
+		eventMarkets, err := AdaptV2EventMarkets(evResp.Event)
+		if err != nil {
+			c.log.Warn("connector", "kalshi", fmt.Sprintf("adapt event %q: %v", evResp.Event.EventTicker, err))
+			continue
+		}
+		for _, m := range eventMarkets {
+			if _, seen := seenTickers[m.VenueID]; seen {
+				continue
+			}
+			seenTickers[m.VenueID] = struct{}{}
+			markets = append(markets, m)
+			if len(markets) >= venues.MaxMarketsPerVenue {
+				return markets, eventsUsed
+			}
+		}
+	}
+
+	return markets, eventsUsed
+}
+
+// fetchMarketsViaSearchSeries uses v1 search/series (existing implementation).
+func (c *KalshiClient) fetchMarketsViaSearchSeries(ctx context.Context, query string) ([]models.Market, error) {
 	params := SearchParams{
 		Query:    query,
 		PageSize: defaultSearchPageSize,
@@ -160,6 +239,35 @@ func (c *KalshiClient) SearchSeries(ctx context.Context, params SearchParams) (*
 			Layer:   "connector",
 			Venue:   "kalshi",
 			Message: "failed to decode search response",
+			Err:     err,
+		}
+	}
+	return &result, nil
+}
+
+// FetchEventByURL fetches one event with nested markets from a full URL (e.g. from KalshiDB's kalshi_url).
+// The URL should point at trade-api/v2/events/{event_ticker}?with_nested_markets=true.
+// Returns live prices and market list for that event.
+func (c *KalshiClient) FetchEventByURL(ctx context.Context, kalshiURL string) (*V2EventResponse, error) {
+	if kalshiURL == "" {
+		return nil, &equinoxerrors.EquinoxError{
+			Layer:   "connector",
+			Venue:   "kalshi",
+			Message: "kalshi_url is empty",
+		}
+	}
+	resp, err := c.doGet(ctx, kalshiURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var result V2EventResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, &equinoxerrors.EquinoxError{
+			Layer:   "connector",
+			Venue:   "kalshi",
+			Message: "failed to decode v2 event response",
 			Err:     err,
 		}
 	}

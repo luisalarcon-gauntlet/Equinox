@@ -91,6 +91,9 @@ func main() {
 		"venues: kalshi=%s  polymarket=%s",
 		cfg.KalshiBaseURL, cfg.PolymarketBaseURL,
 	))
+	if cfg.KalshiDBAPIKey != "" {
+		log.Info("main", "", fmt.Sprintf("kalshidb: enabled (base=%s)", cfg.KalshiDBBaseURL))
+	}
 	log.Info("main", "", fmt.Sprintf(
 		"heuristic threshold=%.2f  staleness=%s  timeout=%s",
 		cfg.HeuristicConfidenceThreshold,

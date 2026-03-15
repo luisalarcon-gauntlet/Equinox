@@ -279,6 +279,65 @@ func categorizeSearchResult(series KalshiSeriesResult) string {
 	}
 }
 
+// v2EventToSeries builds a minimal KalshiSeriesResult from a v2 event for use with AdaptKalshiMarket.
+func v2EventToSeries(ev V2Event) KalshiSeriesResult {
+	return KalshiSeriesResult{
+		EventTicker:   ev.EventTicker,
+		SeriesTicker:  ev.SeriesTicker,
+		EventTitle:    ev.Title,
+		EventSubtitle: ev.SubTitle,
+		Category:      ev.Category,
+	}
+}
+
+// v2MarketToKalshiMarket copies fields from v2 market into KalshiMarket so AdaptKalshiMarket can be used.
+func v2MarketToKalshiMarket(m V2Market) KalshiMarket {
+	return KalshiMarket{
+		Ticker:               m.Ticker,
+		YesSubtitle:          m.YesSubtitle,
+		NoSubtitle:           m.NoSubtitle,
+		YesBid:               m.YesBid,
+		YesAsk:               m.YesAsk,
+		LastPrice:            m.LastPrice,
+		YesBidDollars:        m.YesBidDollars,
+		YesAskDollars:        m.YesAskDollars,
+		LastPriceDollars:     m.LastPriceDollars,
+		Volume:               m.Volume,
+		CloseTS:              m.CloseTS,
+		ExpectedExpirationTS: m.ExpectedExpirationTS,
+		OpenTS:               m.OpenTS,
+		Status:               m.Status,
+		Result:               m.Result,
+		CustomStrike:         m.CustomStrike,
+		RulebookVariables:    m.RulebookVariables,
+	}
+}
+
+// AdaptV2EventMarkets converts a v2 event and its nested markets into canonical models.Market slice.
+// Uses the same filtering as the v1 path: open status, no result, non-degenerate prices.
+func AdaptV2EventMarkets(ev V2Event) ([]models.Market, error) {
+	series := v2EventToSeries(ev)
+	var out []models.Market
+	for i := range ev.Markets {
+		leg := v2MarketToKalshiMarket(ev.Markets[i])
+		if leg.Status != "" && mapKalshiStatus(leg.Status) != "open" {
+			continue
+		}
+		if leg.Result != "" {
+			continue
+		}
+		m, err := AdaptKalshiMarket(series, leg)
+		if err != nil {
+			continue
+		}
+		if m.YesMid <= degeneratePriceThreshold || m.YesMid >= (1.0-degeneratePriceThreshold) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
 // generateID creates a deterministic UUID v5 from a Kalshi ticker so the same
 // market always gets the same internal ID across fetches.
 func generateID(ticker string) string {
