@@ -262,6 +262,87 @@ func generatePolyID(id string) string {
 	return uuid.NewSHA1(polymarketNamespace, []byte("polymarket:"+id)).String()
 }
 
+// AdaptCLOBMarket converts a CLOBMarket (GET /markets/{conditionId}) into the
+// canonical models.Market. Prices come from Tokens[0].Price (the first outcome,
+// treated as "Yes"). When the market has fewer than 2 tokens or the condition ID
+// is empty, an error is returned.
+//
+// Spread is set to 0 because the CLOB /markets endpoint exposes a mid price per
+// token, not an explicit top-of-book bid/ask. Both YesBid and YesAsk are set to
+// the same price so downstream spread-based filters don't reject the market.
+func AdaptCLOBMarket(raw CLOBMarket) (models.Market, error) {
+	if raw.ConditionID == "" {
+		return models.Market{}, &equinoxerrors.EquinoxError{
+			Layer:   "normalizer",
+			Venue:   "polymarket",
+			Message: "CLOB market condition_id is empty",
+		}
+	}
+	if len(raw.Tokens) == 0 {
+		return models.Market{}, &equinoxerrors.EquinoxError{
+			Layer:   "normalizer",
+			Venue:   "polymarket",
+			Message: "CLOB market has no tokens",
+		}
+	}
+
+	// Use first token as the "Yes" outcome price.
+	yesPrice := raw.Tokens[0].Price
+	if yesPrice < 0 || yesPrice > 1 {
+		return models.Market{}, &equinoxerrors.EquinoxError{
+			Layer:   "normalizer",
+			Venue:   "polymarket",
+			Message: fmt.Sprintf("CLOB token price %.4f outside [0,1]", yesPrice),
+		}
+	}
+
+	// Parse resolution date from end_date_iso (RFC3339 or YYYY-MM-DD).
+	var resolvesAt time.Time
+	var resolutionDate string
+	if raw.EndDateIso != "" {
+		if t, err := time.Parse(time.RFC3339, raw.EndDateIso); err == nil {
+			resolvesAt = t
+			resolutionDate = t.UTC().Format("2006-01-02")
+		} else if t, err := time.Parse("2006-01-02", raw.EndDateIso); err == nil {
+			resolvesAt = t.UTC()
+			resolutionDate = t.Format("2006-01-02")
+		}
+	}
+
+	status := "open"
+	if raw.Closed {
+		status = "closed"
+	}
+
+	underlying := extractPolymarketUnderlying(raw.Question, raw.Tags)
+	strikePrice := parsePolymarketStrikePrice(raw.Question)
+
+	category := "other"
+	if len(raw.Tags) > 0 && raw.Tags[0] != "" {
+		category = raw.Tags[0]
+	}
+
+	return models.Market{
+		ID:             generatePolyID(raw.ConditionID),
+		VenueID:        raw.ConditionID,
+		Venue:          "polymarket",
+		Title:          normalizeTitle(raw.Question),
+		YesBid:         yesPrice,
+		YesAsk:         yesPrice,
+		YesMid:         yesPrice,
+		NoPrice:        1.0 - yesPrice,
+		Spread:         0,
+		ResolvesAt:     resolvesAt,
+		ResolutionDate: resolutionDate,
+		FetchedAt:      time.Now(),
+		Underlying:     underlying,
+		StrikePrice:    strikePrice,
+		Category:       category,
+		Status:         status,
+		RawData:        raw,
+	}, nil
+}
+
 // AdaptSearchMarket transforms a /public-search Market (and its parent Event)
 // into the canonical models.Market. This is the adapter used by FetchMarkets
 // after SearchActiveMarkets returns filtered, price-enriched results.

@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"time"
 
 	equinoxerrors "github.com/equinox/errors"
@@ -15,11 +16,14 @@ type Config struct {
 	OpenAIAPIKey                 string
 	OpenAIBaseURL                string
 	KalshiBaseURL                string
+	KalshiDBBaseURL              string
+	KalshiDBAPIKey               string
 	PolymarketBaseURL            string
 	HTTPTimeout                  time.Duration
 	ServerPort                   string
 	HeuristicConfidenceThreshold float64
 	PriceDataStalenessThreshold  time.Duration
+	MatchesMinConfidence         float64 // MATCHES_MIN_CONFIDENCE, default 0.60
 }
 
 // Load reads configuration from environment variables and applies defaults.
@@ -46,11 +50,14 @@ func Load() (*Config, error) {
 		OpenAIAPIKey:                 apiKey,
 		OpenAIBaseURL:                envOrDefault("OPENAI_BASE_URL", "https://api.openai.com/v1"),
 		KalshiBaseURL:                envOrDefault("KALSHI_BASE_URL", "https://api.elections.kalshi.com"),
+		KalshiDBBaseURL:              envOrDefault("KALSHI_DB_BASE_URL", "http://localhost:8000"),
+		KalshiDBAPIKey:               os.Getenv("KALSHI_DB_API_KEY"),
 		PolymarketBaseURL:            envOrDefault("POLYMARKET_BASE_URL", "https://gamma-api.polymarket.com"),
 		ServerPort:                   serverPort,
 		HTTPTimeout:                  envDurationOrDefault("HTTP_TIMEOUT", 10*time.Second),
 		HeuristicConfidenceThreshold: 0.80,
 		PriceDataStalenessThreshold:  envDurationOrDefault("PRICE_STALENESS_THRESHOLD", 2*time.Minute),
+		MatchesMinConfidence:         envFloat64OrDefault("MATCHES_MIN_CONFIDENCE", 0.60),
 	}
 
 	return cfg, nil
@@ -73,4 +80,16 @@ func envDurationOrDefault(key string, defaultVal time.Duration) time.Duration {
 		return defaultVal
 	}
 	return d
+}
+
+func envFloat64OrDefault(key string, defaultVal float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return defaultVal
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return defaultVal
+	}
+	return f
 }

@@ -94,6 +94,33 @@ func (m *Market) parsePrices() error {
 	return nil
 }
 
+// ─── CLOB API market type (GET /markets/{conditionId}) ───────────────────────
+
+// CLOBToken is one outcome token within a CLOBMarket (e.g. "Trail Blazers" or "Yes").
+type CLOBToken struct {
+	TokenID string  `json:"token_id"`
+	Outcome string  `json:"outcome"`
+	Price   float64 `json:"price"` // current mid price 0.0–1.0
+	Winner  bool    `json:"winner"`
+}
+
+// CLOBMarket is the response from GET https://clob.polymarket.com/markets/{conditionId}.
+// The condition_id is the primary key; individual token prices are in the Tokens slice.
+type CLOBMarket struct {
+	ConditionID     string      `json:"condition_id"`
+	Question        string      `json:"question"`
+	Description     string      `json:"description"`
+	MarketSlug      string      `json:"market_slug"`
+	EndDateIso      string      `json:"end_date_iso"`
+	GameStartTime   string      `json:"game_start_time"`
+	Active          bool        `json:"active"`
+	Closed          bool        `json:"closed"`
+	Archived        bool        `json:"archived"`
+	AcceptingOrders bool        `json:"accepting_orders"`
+	Tags            []string    `json:"tags"`
+	Tokens          []CLOBToken `json:"tokens"`
+}
+
 // ─── /markets endpoint type ───────────────────────────────────────────────────
 
 // PolymarketMarket mirrors the market object returned by the Polymarket

@@ -10,6 +10,7 @@ import (
 	"github.com/equinox/equivalence/tools"
 	"github.com/equinox/logger"
 	"github.com/equinox/models"
+	"github.com/equinox/trace"
 )
 
 // Tier thresholds for the two-tier pre-filter.
@@ -73,6 +74,24 @@ func NewDetector(threshold float64, aiClient AIEvaluator, log *logger.Logger) *D
 // surfaced as warnings inside the result (graceful degradation).
 // Use DetectAllPairs for bulk evaluation; it batches AI calls more efficiently.
 func (d *Detector) Detect(ctx context.Context, marketA, marketB models.Market) (models.MatchResult, error) {
+	// Short-circuit: if the KalshiDB match table already links these markets
+	// with confidence above the detector threshold, skip heuristic + AI.
+	if marketA.CrossVenueConfidence >= d.threshold {
+		d.log.Info("equivalence", "", fmt.Sprintf(
+			"equivalence: precomputed match confidence=%.2f type=%s — skipping heuristic+AI",
+			marketA.CrossVenueConfidence, marketA.CrossVenueMatchType,
+		))
+		return models.MatchResult{
+			MarketA:    marketA,
+			MarketB:    marketB,
+			IsMatch:    true,
+			Confidence: marketA.CrossVenueConfidence,
+			Method:     "precomputed",
+			Reasoning:  fmt.Sprintf("DB match type=%s confidence=%.2f", marketA.CrossVenueMatchType, marketA.CrossVenueConfidence),
+			MatchedAt:  time.Now(),
+		}, nil
+	}
+
 	hResult := d.heuristic.Match(marketA, marketB)
 
 	if hResult.Confidence < tierRejectCeiling {
@@ -117,6 +136,31 @@ func (d *Detector) DetectAllPairs(ctx context.Context, pairs []models.MarketPair
 		return nil, nil
 	}
 
+	// Allocate result slice indexed by original pair position.
+	finalResults := make([]models.MatchResult, len(pairs))
+
+	// ── Phase 0: pre-computed short-circuit ──────────────────────────────────
+	// Pairs whose Kalshi market already has a DB-computed confidence above the
+	// detector threshold are resolved immediately without heuristic or AI calls.
+	var needsEval []int // indices into pairs that still need heuristic+AI
+	precomputedCount := 0
+	for i, p := range pairs {
+		if p.A.CrossVenueConfidence >= d.threshold {
+			precomputedCount++
+			finalResults[i] = models.MatchResult{
+				MarketA:    p.A,
+				MarketB:    p.B,
+				IsMatch:    true,
+				Confidence: p.A.CrossVenueConfidence,
+				Method:     "precomputed",
+				Reasoning:  fmt.Sprintf("DB match type=%s confidence=%.2f", p.A.CrossVenueMatchType, p.A.CrossVenueConfidence),
+				MatchedAt:  time.Now(),
+			}
+		} else {
+			needsEval = append(needsEval, i)
+		}
+	}
+
 	// ── Phase 1: run heuristics concurrently ─────────────────────────────────
 	type heuristicItem struct {
 		idx    int
@@ -124,20 +168,18 @@ func (d *Detector) DetectAllPairs(ctx context.Context, pairs []models.MarketPair
 		result models.MatchResult
 	}
 
-	hCh := make(chan heuristicItem, len(pairs))
+	hCh := make(chan heuristicItem, len(needsEval))
 	var wg sync.WaitGroup
-	for i, p := range pairs {
+	for _, i := range needsEval {
 		wg.Add(1)
 		go func(idx int, pr models.MarketPair) {
 			defer wg.Done()
 			hCh <- heuristicItem{idx: idx, pair: pr, result: d.heuristic.Match(pr.A, pr.B)}
-		}(i, p)
+		}(i, pairs[i])
 	}
 	wg.Wait()
 	close(hCh)
 
-	// Allocate result slice indexed by original pair position.
-	finalResults := make([]models.MatchResult, len(pairs))
 	var tier2 []heuristicItem
 
 	for item := range hCh {
@@ -149,6 +191,11 @@ func (d *Detector) DetectAllPairs(ctx context.Context, pairs []models.MarketPair
 	}
 
 	if len(tier2) == 0 {
+		evaluatedCount := len(pairs) - precomputedCount
+		trace.FromContext(ctx).Add(fmt.Sprintf(
+			"equivalence: precomputed %d pairs skipped, %d pairs evaluated (heuristic+AI)",
+			precomputedCount, evaluatedCount,
+		))
 		return finalResults, nil
 	}
 
@@ -210,6 +257,12 @@ func (d *Detector) DetectAllPairs(ctx context.Context, pairs []models.MarketPair
 			finalResults[item.idx] = d.buildAIResult(item.pair.A, item.pair.B, item.hResult, batchResults[j])
 		}
 	}
+
+	evaluatedCount := len(pairs) - precomputedCount
+	trace.FromContext(ctx).Add(fmt.Sprintf(
+		"equivalence: precomputed %d pairs skipped, %d pairs evaluated (heuristic+AI)",
+		precomputedCount, evaluatedCount,
+	))
 
 	return finalResults, nil
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/equinox/logger"
 	"github.com/equinox/venues"
 	"github.com/equinox/venues/kalshi"
+	"github.com/equinox/venues/kalshidb"
 )
 
 func newTestClient(t *testing.T, serverURL string) *kalshi.KalshiClient {
@@ -266,11 +267,11 @@ func TestKalshiFetchLimitsToTopTenMarkets(t *testing.T) {
 					EventTicker:  "KXTEST-26NOV01",
 					EventTitle:   "Test Market Event",
 					Category:     "other",
-					Markets:      make([]kalshi.KalshiMarket, 0, 12),
+					Markets:      make([]kalshi.KalshiMarket, 0, venues.MaxMarketsPerVenue+5),
 				},
 			},
 		}
-		for i := 1; i <= 12; i++ {
+		for i := 1; i <= venues.MaxMarketsPerVenue+5; i++ {
 			resp.CurrentPage[0].Markets = append(resp.CurrentPage[0].Markets, kalshi.KalshiMarket{
 				Ticker:        fmt.Sprintf("KXTEST-26NOV01-T%d", i),
 				YesSubtitle:   fmt.Sprintf("Will test market %d resolve Yes?", i),
@@ -294,8 +295,8 @@ func TestKalshiFetchLimitsToTopTenMarkets(t *testing.T) {
 	if len(markets) != venues.MaxMarketsPerVenue {
 		t.Fatalf("got %d markets, want %d", len(markets), venues.MaxMarketsPerVenue)
 	}
-	if markets[len(markets)-1].VenueID != "KXTEST-26NOV01-T10" {
-		t.Fatalf("last returned market = %q, want %q", markets[len(markets)-1].VenueID, "KXTEST-26NOV01-T10")
+	if markets[len(markets)-1].VenueID != fmt.Sprintf("KXTEST-26NOV01-T%d", venues.MaxMarketsPerVenue) {
+		t.Fatalf("last returned market = %q, want KXTEST-26NOV01-T%d", markets[len(markets)-1].VenueID, venues.MaxMarketsPerVenue)
 	}
 }
 
@@ -426,6 +427,95 @@ func TestKalshiRetryOn429ExhaustsRetries(t *testing.T) {
 	}
 	if got := int(attempts.Load()); got != 4 {
 		t.Errorf("want 4 server hits (1 initial + 3 retries), got %d", got)
+	}
+}
+
+// newTestClientWithKalshiDB builds a client with KalshiDB enabled for tests that need fallback behavior.
+func newTestClientWithKalshiDB(t *testing.T, kalshiBaseURL, kalshiDBBaseURL, kalshiDBAPIKey string) *kalshi.KalshiClient {
+	t.Helper()
+	cfg := &config.Config{
+		KalshiBaseURL:   kalshiBaseURL,
+		KalshiDBBaseURL: kalshiDBBaseURL,
+		KalshiDBAPIKey:  kalshiDBAPIKey,
+		HTTPTimeout:     5 * time.Second,
+	}
+	log := logger.New(io.Discard)
+	client, err := kalshi.NewKalshiClient(cfg, log)
+	if err != nil {
+		t.Fatalf("NewKalshiClient: %v", err)
+	}
+	kalshi.SetRetryBaseDelay(client, 0)
+	kalshi.SetRateLimiter(client, rate.NewLimiter(rate.Inf, 1))
+	return client
+}
+
+func TestKalshiFetchEventByURLDecodesResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(kalshi.V2EventResponse{
+			Event: kalshi.V2Event{
+				EventTicker:  "KXTEST-26MAR01",
+				SeriesTicker: "KXTEST",
+				Title:        "Test Event",
+				Category:     "other",
+				Markets: []kalshi.V2Market{
+					{
+						Ticker:        "KXTEST-26MAR01-T1",
+						YesBidDollars: "0.45",
+						YesAskDollars: "0.55",
+						CloseTime:     "2026-03-01T21:00:00Z",
+						Status:        "open",
+					},
+				},
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	resp, err := client.FetchEventByURL(context.Background(), server.URL+"/event")
+	if err != nil {
+		t.Fatalf("FetchEventByURL: %v", err)
+	}
+	if resp.Event.EventTicker != "KXTEST-26MAR01" {
+		t.Errorf("Event.EventTicker = %q, want KXTEST-26MAR01", resp.Event.EventTicker)
+	}
+	if len(resp.Event.Markets) != 1 {
+		t.Fatalf("len(Event.Markets) = %d, want 1", len(resp.Event.Markets))
+	}
+	if resp.Event.Markets[0].Ticker != "KXTEST-26MAR01-T1" {
+		t.Errorf("Market.Ticker = %q, want KXTEST-26MAR01-T1", resp.Event.Markets[0].Ticker)
+	}
+}
+
+func TestKalshiFetchMarketsFallbackWhenKalshiDBEmpty(t *testing.T) {
+	// Single server: /v1/search (KalshiDB) returns empty; /v1/search/series returns markets.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/v1/search" {
+			_ = json.NewEncoder(w).Encode(kalshidb.SearchResponse{
+				Query:   r.URL.Query().Get("q"),
+				Results: nil,
+				Meta:    kalshidb.SearchMeta{TotalResults: 0},
+			})
+			return
+		}
+		if r.URL.Path == "/v1/search/series" {
+			_ = json.NewEncoder(w).Encode(oneSearchResponse())
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := newTestClientWithKalshiDB(t, server.URL, server.URL, "test-key")
+	markets, err := client.FetchMarkets(context.Background(), "bitcoin")
+	if err != nil {
+		t.Fatalf("FetchMarkets: %v", err)
+	}
+	// KalshiDB returns empty results, so we fall back to search/series and get one market.
+	if len(markets) != 1 {
+		t.Errorf("got %d markets, want 1 (fallback to search)", len(markets))
 	}
 }
 

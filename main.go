@@ -24,6 +24,7 @@ import (
 	"github.com/equinox/server"
 	"github.com/equinox/venues"
 	"github.com/equinox/venues/kalshi"
+	"github.com/equinox/venues/kalshidb"
 	"github.com/equinox/venues/polymarket"
 )
 
@@ -56,7 +57,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	polyClient := polymarket.NewPolymarketClient(cfg, log)
+	// Create a KalshiDB client for Polymarket DB-backed search when credentials
+	// are configured. Kalshi's own client creates an independent instance for
+	// its search path; sharing credentials is intentional per the architecture.
+	var dbClient *kalshidb.Client
+	if cfg.KalshiDBAPIKey != "" {
+		dbClient = kalshidb.NewClient(cfg.KalshiDBBaseURL, cfg.KalshiDBAPIKey, cfg.HTTPTimeout, log)
+		log.Info("main", "", "polymarketdb: enabled")
+	}
+
+	polyClient := polymarket.NewPolymarketClient(cfg, log, dbClient)
 
 	connectors := []venues.VenueConnector{kalshiClient, polyClient}
 
@@ -91,6 +101,9 @@ func main() {
 		"venues: kalshi=%s  polymarket=%s",
 		cfg.KalshiBaseURL, cfg.PolymarketBaseURL,
 	))
+	if cfg.KalshiDBAPIKey != "" {
+		log.Info("main", "", fmt.Sprintf("kalshidb: enabled (base=%s)", cfg.KalshiDBBaseURL))
+	}
 	log.Info("main", "", fmt.Sprintf(
 		"heuristic threshold=%.2f  staleness=%s  timeout=%s",
 		cfg.HeuristicConfidenceThreshold,

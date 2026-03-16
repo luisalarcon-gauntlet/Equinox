@@ -15,27 +15,33 @@ import (
 	equinoxerrors "github.com/equinox/errors"
 	"github.com/equinox/logger"
 	"github.com/equinox/models"
+	"github.com/equinox/trace"
 	"github.com/equinox/venues"
+	"github.com/equinox/venues/kalshidb"
 )
 
 // PolymarketClient fetches market data from the Polymarket Gamma API and
 // adapts raw responses into canonical models.Market structs.
 //
-// Unlike Kalshi, the Polymarket Gamma API is fully public and requires no
-// authentication. The response is a JSON array (not a wrapped object), which
-// the client handles by decoding directly into []PolymarketMarket.
+// When db is non-nil the client first queries the KalshiDB Polymarket search
+// endpoint (GET /v1/polymarket/search) for semantic results, then fetches live
+// prices from each result's CLOB URL. The Gamma /public-search path is used
+// as a fallback when the DB returns nothing or when db is nil.
 type PolymarketClient struct {
 	httpClient *http.Client
 	baseURL    string
 	log        *logger.Logger
+	db         *kalshidb.Client // optional; nil → Gamma-only mode
 }
 
-// NewPolymarketClient constructs a PolymarketClient from the provided config.
-func NewPolymarketClient(cfg *config.Config, log *logger.Logger) *PolymarketClient {
+// NewPolymarketClient constructs a PolymarketClient. When db is non-nil, DB-backed
+// search is preferred over the Gamma /public-search fallback.
+func NewPolymarketClient(cfg *config.Config, log *logger.Logger, db *kalshidb.Client) *PolymarketClient {
 	return &PolymarketClient{
 		httpClient: &http.Client{Timeout: cfg.HTTPTimeout},
 		baseURL:    cfg.PolymarketBaseURL,
 		log:        log,
+		db:         db,
 	}
 }
 
@@ -47,20 +53,131 @@ func (c *PolymarketClient) GetVenueName() string { return "polymarket" }
 // effectively decided and excluded from results.
 const polyDegeneratePriceThreshold = 0.03
 
-// FetchMarkets queries the Polymarket /public-search endpoint (via
-// SearchActiveMarkets) and adapts every surviving market into a canonical
-// models.Market. The /public-search endpoint returns current, properly
-// grouped events — unlike /markets, which returns stale historical data.
-//
-// All filtering (active, closed, stale year, end-date freshness, degenerate
-// price) is handled inside SearchActiveMarkets before markets reach this
-// method. Markets that pass all guards but fail adaptation are logged and
-// skipped — partial results are always better than aborting the entire fetch.
+// polyDBSearchLimit is the max results requested from the KalshiDB Polymarket
+// search endpoint per query.
+const polyDBSearchLimit = 10
+
+// FetchMarkets returns Polymarket markets for query. When a KalshiDB client is
+// configured it first tries GET /v1/polymarket/search and fetches live CLOB
+// prices for each result. If DB search returns nothing or fails, it falls back
+// to the Gamma /public-search endpoint.
 func (c *PolymarketClient) FetchMarkets(ctx context.Context, query string) ([]models.Market, error) {
+	if c.db != nil {
+		markets, err := c.fetchMarketsViaDB(ctx, query)
+		if err != nil {
+			c.log.Warn("connector", "polymarket",
+				fmt.Sprintf("polymarket: db-search failed, falling back to gamma: %v", err))
+			trace.FromContext(ctx).Add("polymarket: db-search empty → gamma fallback")
+		} else if len(markets) > 0 {
+			return markets, nil
+		} else {
+			// DB returned no results — fall through to Gamma.
+			trace.FromContext(ctx).Add("polymarket: db-search empty → gamma fallback")
+		}
+	}
+
+	return c.fetchMarketsViaGamma(ctx, query)
+}
+
+// fetchMarketsViaDB calls GET /v1/polymarket/search, then fetches a live CLOB
+// market for each result. Markets whose CLOB fetch fails are skipped (non-fatal).
+func (c *PolymarketClient) fetchMarketsViaDB(ctx context.Context, query string) ([]models.Market, error) {
+	resp, err := c.db.SearchPolymarket(ctx, query, polyDBSearchLimit)
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil || len(resp.Results) == 0 {
+		return nil, nil
+	}
+
+	c.log.Info("connector", "polymarket",
+		fmt.Sprintf("polymarket: db-search returned %d results for query=%q", len(resp.Results), query))
+	trace.FromContext(ctx).Add(
+		fmt.Sprintf("polymarket: db-search (primary) → %d results", len(resp.Results)),
+	)
+
+	var markets []models.Market
+	ok, total := 0, 0
+	for _, r := range resp.Results {
+		if r.ClobURL == "" {
+			continue
+		}
+		total++
+		m, err := c.fetchCLOBMarket(ctx, r.ClobURL)
+		if err != nil {
+			c.log.Warn("connector", "polymarket",
+				fmt.Sprintf("polymarket: clob-fetch failed url=%s: %v", r.ClobURL, err))
+			continue
+		}
+		ok++
+		markets = append(markets, m)
+		if len(markets) >= venues.MaxMarketsPerVenue {
+			break
+		}
+	}
+
+	trace.FromContext(ctx).Add(fmt.Sprintf("polymarket: clob-fetch %d/%d ok", ok, total))
+	c.log.Info("connector", "polymarket",
+		fmt.Sprintf("polymarket: clob-fetch %d/%d succeeded", ok, total))
+
+	return markets, nil
+}
+
+// fetchCLOBMarket fetches a single market from the Polymarket CLOB API and
+// adapts it via AdaptPolymarketMarket to get real bid/ask prices.
+func (c *PolymarketClient) fetchCLOBMarket(ctx context.Context, clobURL string) (models.Market, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, clobURL, nil)
+	if err != nil {
+		return models.Market{}, &equinoxerrors.EquinoxError{
+			Layer:   "connector",
+			Venue:   "polymarket",
+			Message: "failed to build CLOB request",
+			Err:     err,
+		}
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return models.Market{}, &equinoxerrors.EquinoxError{
+			Layer:   "connector",
+			Venue:   "polymarket",
+			Message: "CLOB HTTP request failed",
+			Err:     err,
+		}
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return models.Market{}, &equinoxerrors.EquinoxError{
+			Layer:   "connector",
+			Venue:   "polymarket",
+			Message: fmt.Sprintf("CLOB API returned status %d", resp.StatusCode),
+			Err:     fmt.Errorf("status %d", resp.StatusCode),
+		}
+	}
+
+	var raw CLOBMarket
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return models.Market{}, &equinoxerrors.EquinoxError{
+			Layer:   "connector",
+			Venue:   "polymarket",
+			Message: "failed to decode CLOB market response",
+			Err:     err,
+		}
+	}
+
+	return AdaptCLOBMarket(raw)
+}
+
+// fetchMarketsViaGamma uses the Gamma /public-search fallback path.
+func (c *PolymarketClient) fetchMarketsViaGamma(ctx context.Context, query string) ([]models.Market, error) {
 	events, err := c.SearchActiveMarkets(ctx, query)
 	if err != nil {
 		return nil, err
 	}
+
+	trace.FromContext(ctx).Add(fmt.Sprintf("polymarket: gamma-search → %d events", len(events)))
 
 	markets := make([]models.Market, 0)
 	for _, event := range events {
