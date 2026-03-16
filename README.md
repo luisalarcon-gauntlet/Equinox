@@ -1,5 +1,7 @@
 # Project Equinox
 
+## **[Live Application → equinox-mvp.onrender.com](https://equinox-mvp.onrender.com/)**
+
 Cross-venue prediction market aggregation and intelligent routing prototype.
 Equinox connects to Kalshi and Polymarket, detects equivalent markets across
 both venues using a hybrid heuristic + AI approach, and recommends which
